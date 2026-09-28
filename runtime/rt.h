@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 // ---- core.cpp ---------------------------------------------------------------------------
 PPCFunc ppc_lookup(uint32_t addr);
@@ -64,6 +65,13 @@ void os_profile();                                // WIIKIT_PROFILE: sample the 
 // ---- GX (gx.cpp) -----------------------------------------------------------------
 void gx_init();                                   // after video_configure
 void gx_report();                                 // command stream statistics
+// A port's texture filter: each texture the game uploads, decoded to RGBA
+// (level 0 of w x h first), with the hash of its bytes in memory. Returning
+// true puts `out` (out_w x out_h, RGBA, one level) in its place: a larger
+// version of the same picture, sampled in the GX size's terms.
+using GxTextureFilter = bool (*)(uint32_t fmt, int w, int h, uint64_t hash, const uint8_t* rgba,
+                                 std::vector<uint8_t>& out, int& out_w, int& out_h);
+void gx_set_texture_filter(GxTextureFilter f);
 void gx_trace_next_frame();                       // the next frame's commands to gxtrace_N.txt (F12)
 void gx_submit_pending();                         // after a burst, outside g_hw: hand the record to the renderer
 void gx_draw_done_reached();                      // the renderer: the game's draw-done point is drawn

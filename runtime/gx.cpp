@@ -167,6 +167,8 @@ uint32_t used_maps() {
     return used;
 }
 
+GxTextureFilter tex_filter = nullptr;
+
 void bind_map(int m) {
     int off = (m & 3) + (m >= 4 ? 0x20 : 0);
     uint32_t mode0 = bp[0x80 + off], mode1 = bp[0x84 + off], img0 = bp[0x88 + off],
@@ -225,25 +227,40 @@ void bind_map(int m) {
     }
     if (upload) {
         ++st.uploads;
+        // decoded first: a port's filter may put a larger version in its place
+        // (its own detail; the shaders sample in the GX size's terms)
+        static std::vector<uint8_t> decoded, replaced;
+        decoded.clear();
+        const uint8_t* s = src;
+        for (int l = 0; l < levels; ++l) {
+            int lw = std::max(1, w >> l), lh = std::max(1, h >> l);
+            size_t at = decoded.size();
+            decoded.resize(at + (size_t)lw * lh * 4);
+            gxtex_decode(fmt, lw, lh, s, decoded.data() + at, pal, tfmt);
+            s += gxtex_size(fmt, lw, lh);
+        }
+        int ow = w, oh = h, olevels = levels;
+        const std::vector<uint8_t>* out = &decoded;
+        if (tex_filter && tex_filter(fmt, w, h, e.hash, decoded.data(), replaced, ow, oh)) {
+            out = &replaced;
+            olevels = 1;
+        }
         put<uint8_t>(VC_TEXUP);
         put<uint8_t>((uint8_t)m);
         put<uint32_t>(e.id);
-        put<uint16_t>((uint16_t)w);
-        put<uint16_t>((uint16_t)h);
-        put<uint8_t>((uint8_t)levels);
-        const uint8_t* s = src;
-        size_t at = rec.size();
-        for (int l = 0; l < levels; ++l) {
-            int lw = std::max(1, w >> l), lh = std::max(1, h >> l);
-            gxtex_decode(fmt, lw, lh, s, grow((size_t)lw * lh * 4), pal, tfmt);
-            s += gxtex_size(fmt, lw, lh);
-        }
+        put<uint16_t>((uint16_t)ow);
+        put<uint16_t>((uint16_t)oh);
+        put<uint8_t>((uint8_t)olevels);
+        size_t bytes = 0;
+        for (int l = 0; l < olevels; ++l) bytes += (size_t)std::max(1, ow >> l) * std::max(1, oh >> l) * 4;
+        std::memcpy(grow(bytes), out->data(), bytes);
         static const char* dump = std::getenv("WIIKIT_TEXDUMP");     // debugging: uploads as PNGs
         static int dumped = 0;
         if (dump && dumped < 400 && w * h >= 4096) {
             char name[512];
-            std::snprintf(name, sizeof name, "%s/tex_%04d_%08X_f%u_%dx%d.png", dump, dumped++, addr, fmt, w, h);
-            write_png(name, w, h, rec.data() + at);
+            std::snprintf(name, sizeof name, "%s/tex_%04d_%08X_f%u_%dx%d_%016llX.png", dump, dumped++, addr, fmt, w, h,
+                          (unsigned long long)e.hash);
+            write_png(name, ow, oh, out->data());
         }
         map_bound[m] = e.id;
     } else if (map_bound[m] != e.id) {
@@ -704,3 +721,5 @@ void gx_report() {
            (unsigned long long)st.dls, (unsigned long long)st.copies, (unsigned long long)st.frames,
            (unsigned long long)st.done, (unsigned long long)st.uploads);
 }
+
+void gx_set_texture_filter(GxTextureFilter f) { tex_filter = f; }
