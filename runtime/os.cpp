@@ -200,8 +200,11 @@ void hle_OSLoadContext(PPCContext& c) {
     pass_to(to);
 }
 
+// A thread switch saves the running thread's own context (an OSThread begins
+// with it). Any other save is a snapshot of the registers into a buffer, as a
+// conservative garbage collector takes to scan them (Mono's): no thread changes.
 void hle_OSSaveContext(PPCContext& c) {
-    if (t_self->ctx != c.r[3]) adopt(c.r[3]);
+    if (t_self->ctx != c.r[3] && c.r[3] == ld32(LOW_CURRENT_THREAD)) adopt(c.r[3]);
     orig_OSSaveContext(c);
 }
 
