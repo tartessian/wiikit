@@ -111,3 +111,13 @@ void video_run(const char* title);
 // port plays on its own.
 void video_add_menu_item(const char* (*label)(), void (*choose)());
 void video_on_pause(void (*on_pause)(bool paused));
+
+// The window's display mode: a window, fullscreen at the desktop's mode, or a
+// borderless window covering the screen (--fullscreen, and F11 or Alt+Enter,
+// which toggle between the window and the last fullscreen mode). Any thread
+// may ask; the window's thread applies it. `on_change` hears every change,
+// whoever made it (a port that saves the setting).
+enum { VIDEO_WINDOW = 0, VIDEO_FULLSCREEN = 1, VIDEO_BORDERLESS = 2 };
+void video_set_display_mode(int mode);
+int video_display_mode();
+void video_on_display_mode(void (*on_change)(int mode));

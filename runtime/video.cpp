@@ -715,6 +715,26 @@ enum : uint32_t { CL_UP = 0x0001, CL_LEFT = 0x0002, CL_ZR = 0x0004, CL_X = 0x000
                   CL_Y = 0x0020, CL_B = 0x0040, CL_ZL = 0x0080, CL_R = 0x0200, CL_PLUS = 0x0400,
                   CL_HOME = 0x0800, CL_MINUS = 0x1000, CL_L = 0x2000, CL_DOWN = 0x4000, CL_RIGHT = 0x8000 };
 constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right, then R's: kStick << 0..7
+// the display mode (video_set_display_mode): asked from any thread, applied
+// by the window's; F11 goes back to the last fullscreen mode
+std::atomic<int> display_mode{VIDEO_WINDOW}, display_request{-1};
+int last_fullscreen = VIDEO_BORDERLESS;
+std::vector<void (*)(int)> display_listeners;
+
+void apply_display_mode(int m) {
+    if (m == VIDEO_WINDOW) {
+        SDL_SetWindowFullscreen(win, false);
+    } else {
+        // exclusive: the desktop's own mode; borderless: no mode at all
+        const SDL_DisplayMode* dm = m == VIDEO_FULLSCREEN ? SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(win)) : nullptr;
+        SDL_SetWindowFullscreenMode(win, dm);
+        SDL_SetWindowFullscreen(win, true);
+        last_fullscreen = m;
+    }
+    display_mode = m;
+    for (auto f : display_listeners) f(m);
+}
+
 // the port's Esc menu items and pause listeners (video_add_menu_item, video_on_pause)
 struct MenuItem { const char* (*label)(); void (*choose)(); };
 std::vector<MenuItem> menu_items;
@@ -1320,7 +1340,10 @@ void video_run(const char* title) {
     // windows stay, and the picture keeps its shape with bars at the sides
     int w0 = opt.window_w ? opt.window_w : (opt.widescreen ? 1280 : 960), h0 = opt.window_h ? opt.window_h : 720;
     SDL_WindowFlags wflags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
-    if (opt.fullscreen) wflags |= SDL_WINDOW_FULLSCREEN;
+    if (opt.fullscreen) {
+        wflags |= SDL_WINDOW_FULLSCREEN;
+        display_mode = VIDEO_BORDERLESS;
+    }
     win = SDL_CreateWindow(title, w0, h0, wflags);
     if (!win) rt_die("video: SDL_CreateWindow: %s", SDL_GetError());
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
@@ -1352,6 +1375,7 @@ void video_run(const char* title) {
     uint32_t seen = retraces.load();
     std::string base_title = title;
     for (;;) {
+        if (int r = display_request.exchange(-1); r >= 0 && r != display_mode) apply_display_mode(r);
         SDL_Event e;
         bool quit = false;
         while (SDL_PollEvent(&e)) {
@@ -1363,7 +1387,7 @@ void video_run(const char* title) {
                 (e.key.scancode == SDL_SCANCODE_F11 ||
                  ((e.key.scancode == SDL_SCANCODE_RETURN || e.key.scancode == SDL_SCANCODE_KP_ENTER) &&
                   (e.key.mod & SDL_KMOD_ALT))))
-                SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
+                apply_display_mode(display_mode == VIDEO_WINDOW ? last_fullscreen : VIDEO_WINDOW);
             // F12: the next frame's GX commands to a file (debugging, as WIIKIT_GXTRACE)
             if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat)
                 gx_trace_next_frame();
@@ -1463,3 +1487,11 @@ void video_run(const char* title) {
 
 void video_add_menu_item(const char* (*label)(), void (*choose)()) { menu_items.push_back({label, choose}); }
 void video_on_pause(void (*on_pause)(bool paused)) { pause_listeners.push_back(on_pause); }
+void video_set_display_mode(int mode) {
+    if (mode >= VIDEO_WINDOW && mode <= VIDEO_BORDERLESS) display_request = mode;
+}
+int video_display_mode() {
+    const int r = display_request.load();
+    return r >= 0 ? r : display_mode.load();
+}
+void video_on_display_mode(void (*on_change)(int mode)) { display_listeners.push_back(on_change); }
