@@ -910,13 +910,18 @@ void write_png(const std::string& path, int w, int h, const uint8_t* rgba) {
 
 namespace {
 
+// the TV's shape (video_set_widescreen): SYSCONF's at the start, then as asked;
+// the picture's place in the window follows it at the next present
+std::atomic<bool> widescreen{false};
+std::vector<void (*)(bool)> widescreen_listeners;
+
 // Where the picture sits in a window of w x h (pixels or window units): the
-// TV's screen, 4:3 or 16:9 as SYSCONF says, as large as the window allows and
+// TV's screen, 4:3 or 16:9 (widescreen), as large as the window allows and
 // centred; of its 480 lines (NTSC) VI scans the XFB out over its active ones,
 // centred too (360 for a game letterboxing 16:9 on a 4:3 screen).
 struct Rect { float x, y, w, h; };
 Rect picture_rect(float w, float h) {
-    float aspect = opt.widescreen ? 16.0f / 9 : 4.0f / 3;
+    float aspect = widescreen ? 16.0f / 9 : 4.0f / 3;
     float sw = w, sh = w / aspect;
     if (sh > h) { sh = h; sw = h * aspect; }
     float ph = sh * (float)std::min<uint32_t>(vi_lines.load(), 480) / 480;
@@ -950,7 +955,7 @@ std::vector<void (*)(int)> scale_listeners;
 int auto_scale() {
     int ww = 0, wh = 0;
     SDL_GetWindowSizeInPixels(win, &ww, &wh);
-    float aspect = opt.widescreen ? 16.0f / 9 : 4.0f / 3;
+    float aspect = widescreen ? 16.0f / 9 : 4.0f / 3;
     float sh = std::min((float)wh, (float)ww / aspect);
     return std::clamp((int)std::ceil(sh / 480 - 0.01f), 1, 4);
 }
@@ -1531,7 +1536,7 @@ void setup() {
 
 // ---- the game's side ------------------------------------------------------------------------------
 bool video_enabled() { return opt.enabled; }
-void video_configure(const VideoOptions& o) { opt = o; S = std::max(1, o.scale); }
+void video_configure(const VideoOptions& o) { opt = o; S = std::max(1, o.scale); widescreen = o.widescreen; }
 
 VideoPerf g_vperf;
 bool g_vperf_on = std::getenv("WIIKIT_PERF") != nullptr;
@@ -1778,3 +1783,10 @@ void video_set_ambient_occlusion(int level) {
 }
 int video_ambient_occlusion() { return ao_level.load(); }
 void video_on_ambient_occlusion(void (*on_change)(int level)) { ao_listeners.push_back(on_change); }
+void video_set_widescreen(bool on) {
+    if (widescreen.exchange(on) == on) return;
+    if (scale_setting == 0) scale_request = 0;       // automatic follows the picture's height
+    for (auto f : widescreen_listeners) f(on);
+}
+bool video_widescreen() { return widescreen.load(); }
+void video_on_widescreen(void (*on_change)(bool on)) { widescreen_listeners.push_back(on_change); }

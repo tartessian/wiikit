@@ -143,3 +143,11 @@ void video_on_anisotropy(void (*on_change)(int level));
 void video_set_ambient_occlusion(int level);
 int video_ambient_occlusion();
 void video_on_ambient_occlusion(void (*on_change)(int level));
+
+// The TV's shape, 16:9 or 4:3: SYSCONF's at the start (VideoOptions); a port
+// may change it while the game runs, with what the game reads of it (its
+// SCGetAspectRatio). The picture's place in the window follows at the next
+// present. `on_change` hears changes.
+void video_set_widescreen(bool on);
+bool video_widescreen();
+void video_on_widescreen(void (*on_change)(bool on));
