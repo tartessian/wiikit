@@ -24,7 +24,8 @@
 //
 // Devices so far: /dev/di (the disc, from the extracted tree), /dev/fs and
 // file paths (NAND, on a host folder), /dev/es (title identity, ticket and
-// TMD views), /dev/stm/immediate and /dev/stm/eventhook. Anything else fails
+// TMD views, the title's own contents), /dev/stm/immediate and
+// /dev/stm/eventhook. Anything else fails
 // to open, and every call a device does not know is logged.
 #include "disc.h"
 #include "rt.h"
@@ -92,8 +93,41 @@ struct Device {
 };
 
 std::string g_nand;                                   // host folder holding the NAND
+std::string g_root;                                   // the extracted tree
 std::vector<uint8_t> g_ticket, g_tmd;
 uint64_t g_title = 0;
+
+// The title's own contents (a WiiWare or channel title reads its data through
+// ES, the SDK's CNT library on top): content/<id>.app under the extracted
+// tree, decrypted, as the TMD lists them. A descriptor is an index here.
+struct ContentFile { FILE* f = nullptr; uint32_t size = 0, pos = 0; };
+std::vector<ContentFile> g_contents;
+
+int32_t content_open(uint32_t index) {
+    const uint32_t count = g_tmd.size() >= 0x1E0 ? (uint32_t)g_tmd[0x1DE] << 8 | g_tmd[0x1DF] : 0;
+    for (uint32_t i = 0; i < count && 0x1E4 + 36 * (i + 1) <= g_tmd.size(); ++i) {
+        const uint8_t* r = &g_tmd[0x1E4 + 36 * i];
+        if (((uint32_t)r[4] << 8 | r[5]) != index) continue;
+        char name[32];
+        std::snprintf(name, sizeof name, "/content/%02x%02x%02x%02x.app", r[0], r[1], r[2], r[3]);
+        FILE* f = std::fopen((g_root + name).c_str(), "rb");
+        if (!f) {
+            rt_log("ios: /dev/es: content %u: no %s%s", index, g_root.c_str(), name);
+            return IPC_ENOENT;
+        }
+        std::fseek(f, 0, SEEK_END);
+        ContentFile cf{f, (uint32_t)std::ftell(f), 0};
+        for (size_t fd = 0; fd < g_contents.size(); ++fd)
+            if (!g_contents[fd].f) { g_contents[fd] = cf; return (int32_t)fd; }
+        g_contents.push_back(cf);
+        return (int32_t)g_contents.size() - 1;
+    }
+    return ES_EINVAL;
+}
+
+ContentFile* content_at(uint32_t fd) {
+    return fd < g_contents.size() && g_contents[fd].f ? &g_contents[fd] : nullptr;
+}
 
 void reply(uint32_t addr, int32_t result);
 
@@ -315,6 +349,37 @@ struct ES : Device {
         case 0x35: case 0x3A:                         // Get(Stored/DI)TMD
             fill(io[0].addr, g_tmd.data(), std::min<size_t>(g_tmd.size(), io[0].size));
             return 0;
+        case 0x09:                                    // OpenContent: of the running title, by index
+            return content_open(rd32(in[0].addr));
+        case 0x24:                                    // OpenTitleContent: (title, ticket view, index)
+            if (in.size() < 3 || ld64(in[0].addr) != g_title) return ES_EINVAL;
+            return content_open(rd32(in[2].addr));
+        case 0x0A: {                                  // ReadContent: (fd) -> the buffer
+            ContentFile* cf = content_at(rd32(in[0].addr));
+            if (!cf || io.empty()) return ES_EINVAL;
+            uint32_t n = std::min(io[0].size, cf->size - std::min(cf->pos, cf->size));
+            std::fseek(cf->f, cf->pos, SEEK_SET);
+            n = (uint32_t)std::fread(host(io[0].addr), 1, n, cf->f);
+            cf->pos += n;
+            return (int32_t)n;
+        }
+        case 0x23: {                                  // SeekContent: (fd, offset, whence)
+            ContentFile* cf = content_at(rd32(in[0].addr));
+            if (!cf || in.size() < 3) return ES_EINVAL;
+            const int32_t off = (int32_t)rd32(in[1].addr);
+            const uint32_t whence = rd32(in[2].addr);
+            const int64_t base = whence == 0 ? 0 : whence == 1 ? cf->pos : cf->size;
+            if (whence > 2 || base + off < 0 || base + off > cf->size) return ES_EINVAL;
+            cf->pos = (uint32_t)(base + off);
+            return (int32_t)cf->pos;
+        }
+        case 0x0B: {                                  // CloseContent: (fd)
+            ContentFile* cf = content_at(rd32(in[0].addr));
+            if (!cf) return ES_EINVAL;
+            std::fclose(cf->f);
+            *cf = {};
+            return 0;
+        }
         case 0x08: case 0x25:                         // LaunchTitle
             rt_log("ios: the game launches another title: leaving");
             std::fflush(stdout);
@@ -507,6 +572,7 @@ uint32_t ios_irq_mask() { return irq_mask; }
 
 void ios_init(const char* extract_dir, const char* nand_root) {
     std::string root = extract_dir;
+    g_root = root;
     g_ticket = slurp(root + "/ticket.bin");
     g_tmd = slurp(root + "/tmd.bin");
     if (g_ticket.size() < 0x2A4 || g_tmd.size() < 0x1E4)
