@@ -6,10 +6,12 @@
 //                         [--language en|fr|es|de|it|nl|ja] [--fullscreen] [--window WxH] [--keys FILE]
 //                         [--input auto|pad|keyboard]
 //
-// EXTRACT_DIR comes from `python -m wiikit.disc GAME --extract`. The NAND
-// (saves, SYSCONF) is a host folder, EXTRACT_DIR/../nand by default; its
-// SYSCONF is written on the first run (16:9, English), and --aspect and
-// --language change it for this run and the next ones. The key map is
+// EXTRACT_DIR comes from `python -m wiikit.disc GAME --extract`, or for a
+// title installed on the NAND (WiiWare, a channel) from `python -m wiikit.wad
+// TITLE.wad --extract`. The NAND (saves, SYSCONF) is a host folder,
+// EXTRACT_DIR/../nand by default; its SYSCONF is written on the first run
+// (16:9, English), and --aspect and --language change it for this run and
+// the next ones. The key map is
 // EXTRACT_DIR/../keys.txt unless --keys says otherwise; a missing one is
 // written with the defaults. For a game played with the Classic Controller,
 // --input says what channel 1 is: the keyboard, the mouse and the first
@@ -33,6 +35,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <thread>
 
@@ -95,11 +98,16 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "wiiboot: unknown option %s\n", argv[i]); return 2; }
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);
+    rt_set_game_root(root.c_str());
     if (!mem_init()) rt_die("cannot reserve the guest address space");
     if (vo.keys.empty()) vo.keys = root + "/../keys.txt";
     const bool gamecube = disc_open(root.c_str()) && disc_is_gamecube();
     if (!gamecube) vo.widescreen = sysconf_prepare(nand.c_str(), so);
-    uint32_t entry = boot_disc(root.c_str(), g_sysconf_eurgb60);
+    // a disc's tree has sys/boot.bin; a NAND title's (WiiWare, a channel) has
+    // its contents and sys/main.dol, the executable its loader would load
+    const bool nand_title = !gamecube && !std::filesystem::exists(root + "/sys/boot.bin") &&
+                      std::filesystem::exists(root + "/tmd.bin");
+    uint32_t entry = nand_title ? boot_nand(root.c_str(), g_sysconf_eurgb60) : boot_disc(root.c_str(), g_sysconf_eurgb60);
     video_configure(vo);
     gx_init();
     hw_init();
@@ -118,6 +126,7 @@ int main(int argc, char** argv) {
         if (std::fseek(f, 0x20, SEEK_SET) == 0 && std::fread(name, 1, 64, f)) {}
         std::fclose(f);
     }
+    if (nand_title) std::snprintf(name, sizeof name, "%s", nand_title_name(root.c_str()).c_str());
     std::string title = std::string(name[0] ? name : "wiiboot") + " [" + id + "]";
     rt_log("wiiboot: %s, entry %08X", title.c_str(), entry);
     os_start_main(entry);
