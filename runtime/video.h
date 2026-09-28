@@ -121,3 +121,11 @@ enum { VIDEO_WINDOW = 0, VIDEO_FULLSCREEN = 1, VIDEO_BORDERLESS = 2 };
 void video_set_display_mode(int mode);
 int video_display_mode();
 void video_on_display_mode(void (*on_change)(int mode));
+
+// The internal resolution: the EFB's scale over the console's 640 x 528, or 0
+// for automatic (--scale; automatic follows the window's height, 2 for 720
+// lines, 3 for 1080 or 1440). Any thread may ask; the window's thread
+// applies it between records, remaking the EFB. `on_change` hears changes.
+void video_set_scale(int scale);
+int video_scale_setting();
+void video_on_scale(void (*on_change)(int scale));

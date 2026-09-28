@@ -715,6 +715,36 @@ enum : uint32_t { CL_UP = 0x0001, CL_LEFT = 0x0002, CL_ZR = 0x0004, CL_X = 0x000
                   CL_Y = 0x0020, CL_B = 0x0040, CL_ZL = 0x0080, CL_R = 0x0200, CL_PLUS = 0x0400,
                   CL_HOME = 0x0800, CL_MINUS = 0x1000, CL_L = 0x2000, CL_DOWN = 0x4000, CL_RIGHT = 0x8000 };
 constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right, then R's: kStick << 0..7
+// the internal resolution (video_set_scale): 0 automatic, else the EFB's
+// scale; asked from any thread, applied by the window's between records
+std::atomic<int> scale_setting{0}, scale_request{-1};
+std::vector<void (*)(int)> scale_listeners;
+
+// automatic: enough EFB lines for the window's height: 3 for 1080 or 1440
+// lines, 2 for 720
+int auto_scale() {
+    int ww = 0, wh = 0;
+    SDL_GetWindowSizeInPixels(win, &ww, &wh);
+    float aspect = opt.widescreen ? 16.0f / 9 : 4.0f / 3;
+    float sh = std::min((float)wh, (float)ww / aspect);
+    return std::clamp((int)std::ceil(sh / 480 - 0.01f), 1, 4);
+}
+
+void create_efb();
+
+void resize_efb(int s) {
+    if (s == S) return;
+    S = s;
+    create_efb();
+    rt_log("video: internal resolution x%d (EFB %d x %d)", S, EFB_W * S, EFB_H * S);
+}
+
+void apply_scale(int setting) {
+    scale_setting = setting;
+    resize_efb(setting ? setting : auto_scale());
+    for (auto f : scale_listeners) f(setting);
+}
+
 // the display mode (video_set_display_mode): asked from any thread, applied
 // by the window's; F11 goes back to the last fullscreen mode
 std::atomic<int> display_mode{VIDEO_WINDOW}, display_request{-1};
@@ -1186,12 +1216,12 @@ void present() {
     SDL_GL_SwapWindow(win);
 }
 
-void setup() {
-    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
-    glDisable(GL_DITHER);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-
+// The EFB's color and depth at the internal resolution (S), cleared; again
+// when the scale changes (set_scale): the EFB copies follow on their own, as
+// ensure_tex makes them at each copy's size
+void create_efb() {
+    if (efb_col) glDeleteTextures(1, &efb_col);
+    if (efb_dep) glDeleteTextures(1, &efb_dep);
     glCreateTextures(GL_TEXTURE_2D, 1, &efb_col);
     glTextureStorage2D(efb_col, 1, GL_RGBA8, EFB_W * S, EFB_H * S);
     glCreateTextures(GL_TEXTURE_2D, 1, &efb_dep);
@@ -1200,16 +1230,25 @@ void setup() {
         glTextureParameteri(t, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTextureParameteri(t, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     }
-    glCreateFramebuffers(1, &efb_fbo);
     glNamedFramebufferTexture(efb_fbo, GL_COLOR_ATTACHMENT0, efb_col, 0);
     glNamedFramebufferTexture(efb_fbo, GL_DEPTH_ATTACHMENT, efb_dep, 0);
     if (glCheckNamedFramebufferStatus(efb_fbo, GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         rt_die("video: the EFB framebuffer is incomplete");
-    glCreateFramebuffers(1, &copy_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
     glClearColor(0, 0, 0, 1);
     glClearDepth(1.0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+
+void setup() {
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    glDisable(GL_DITHER);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    glCreateFramebuffers(1, &efb_fbo);
+    create_efb();
+    glCreateFramebuffers(1, &copy_fbo);
 
     glCreateBuffers(1, &vbo);
     const GLbitfield map = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
@@ -1358,15 +1397,8 @@ void video_run(const char* title) {
     }
     wake = SDL_CreateSemaphore(0);
     load_keys(opt.keys.empty() ? std::string("keys.txt") : opt.keys);
-    if (opt.scale <= 0) {
-        // enough EFB lines for the screen's height at the window's first
-        // size: 3 for 1080 or 1440 lines, 2 for 720
-        int ww = 0, wh = 0;
-        SDL_GetWindowSizeInPixels(win, &ww, &wh);
-        float aspect = opt.widescreen ? 16.0f / 9 : 4.0f / 3;
-        float sh = std::min((float)wh, (float)ww / aspect);
-        S = std::clamp((int)std::ceil(sh / 480 - 0.01f), 1, 4);
-    }
+    scale_setting = std::max(0, opt.scale);
+    if (!scale_setting) S = auto_scale();
     rt_log("video: internal resolution x%d (EFB %d x %d)", S, EFB_W * S, EFB_H * S);
     setup();
 
@@ -1376,10 +1408,12 @@ void video_run(const char* title) {
     std::string base_title = title;
     for (;;) {
         if (int r = display_request.exchange(-1); r >= 0 && r != display_mode) apply_display_mode(r);
+        if (int r = scale_request.exchange(-1); r >= 0) apply_scale(r);
         SDL_Event e;
         bool quit = false;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) quit = true;
+            if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED && !scale_setting) resize_efb(auto_scale());
             if (e.type == SDL_EVENT_GAMEPAD_ADDED) pad_added(e.gdevice.which);
             if (e.type == SDL_EVENT_GAMEPAD_REMOVED) pad_removed(e.gdevice.which);
             // F11 or Alt+Enter: fullscreen and back
@@ -1495,3 +1529,11 @@ int video_display_mode() {
     return r >= 0 ? r : display_mode.load();
 }
 void video_on_display_mode(void (*on_change)(int mode)) { display_listeners.push_back(on_change); }
+void video_set_scale(int scale) {
+    if (scale >= 0 && scale <= 8) scale_request = scale;
+}
+int video_scale_setting() {
+    const int r = scale_request.load();
+    return r >= 0 ? r : scale_setting.load();
+}
+void video_on_scale(void (*on_change)(int scale)) { scale_listeners.push_back(on_change); }
