@@ -59,10 +59,36 @@ void count_icall(ICalls& ic, uint32_t addr) {
 }
 }  // namespace
 
+// A call to an address with no recompiled function runs in the interpreter.
+// Past the executable's code it is code written at run time; inside it, a gap
+// in the recompilation (a function reached only through a pointer that
+// discovery took for a label): reported once per address, to be given to the
+// recompiler as a seed.
+static bool in_ram(uint32_t addr) {
+    return !(addr & 3) &&
+           ((addr >= 0x80000000u && addr < 0x81800000u) || (addr >= 0x90000000u && addr < 0x94000000u));
+}
+
+static void report_gap(uint32_t addr) {
+    static std::mutex mx;
+    static std::unordered_map<uint32_t, bool> told;
+    std::lock_guard<std::mutex> lk(mx);
+    if (!told.emplace(addr, true).second) return;
+    rt_log("wiikit: no recompiled function at %s: interpreted (a seed for the recompiler)", rt_name(addr).c_str());
+}
+
 void ppc_call_indirect(PPCContext& c, uint32_t addr) {
     if (ICalls* ic = icalls()) count_icall(*ic, addr);
     PPCFunc f = ppc_lookup(addr);
     if (!f) {
+        if (in_ram(addr) && g_ppc_nfuncs) {
+            const bool in_code = addr >= g_ppc_funcs[0].addr && addr <= g_ppc_funcs[g_ppc_nfuncs - 1].addr;
+            static std::atomic<bool> told{false};
+            if (in_code) report_gap(addr);
+            else if (!told.exchange(true)) rt_log("wiikit: interpreting code written at run time, first at %08X", addr);
+            interp_call(c, addr);
+            return;
+        }
         std::fprintf(stderr, "wiikit: indirect call to %s, not a function\n", rt_name(addr).c_str());
         rt_backtrace(c, stderr);
         std::exit(1);

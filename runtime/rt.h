@@ -8,6 +8,10 @@
 
 // ---- core.cpp ---------------------------------------------------------------------------
 PPCFunc ppc_lookup(uint32_t addr);
+// ---- interp.cpp -------------------------------------------------------------------------
+// Run guest code that has no recompiled function (a JIT's, code written at
+// run time) from `addr` until it returns, as a call would.
+void interp_call(PPCContext& c, uint32_t addr);
 // Optional: a symbols.tsv (python -m wiikit.dol GAME.elf --symbols) names
 // guest addresses in logs and crash reports.
 void rt_load_symbols(const char* tsv);
