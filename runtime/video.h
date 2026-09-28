@@ -129,3 +129,10 @@ void video_on_display_mode(void (*on_change)(int mode));
 void video_set_scale(int scale);
 int video_scale_setting();
 void video_on_scale(void (*on_change)(int scale));
+
+// Anisotropic filtering: 1 (off), 2, 4, 8 or 16 samples, bounded by the GPU,
+// on the textures the game filters linearly. Any thread may ask; the
+// renderer applies it at its next draw. `on_change` hears changes.
+void video_set_anisotropy(int level);
+int video_anisotropy();
+void video_on_anisotropy(void (*on_change)(int level));

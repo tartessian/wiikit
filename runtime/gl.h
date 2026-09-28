@@ -6,6 +6,7 @@
 #define WIIKIT_GL_FUNCS(X)                                                                          \
     X(PFNGLGETERRORPROC, glGetError)                                                                \
     X(PFNGLGETSTRINGPROC, glGetString)                                                              \
+    X(PFNGLGETFLOATVPROC, glGetFloatv)                                                              \
     X(PFNGLENABLEPROC, glEnable)                                                                    \
     X(PFNGLDISABLEPROC, glDisable)                                                                  \
     X(PFNGLVIEWPORTPROC, glViewport)                                                                \

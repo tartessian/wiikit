@@ -88,6 +88,16 @@ PSUniforms ps_last;
 bool ps_valid = false;
 uint32_t sampler_mode[8][2];
 bool sampler_set[8];
+// anisotropic filtering (video_set_anisotropy): asked from any thread; the
+// renderer sets its samplers again when it changes. The GPU's maximum bounds it
+#ifndef GL_TEXTURE_MAX_ANISOTROPY
+#define GL_TEXTURE_MAX_ANISOTROPY 0x84FE
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY 0x84FF
+#endif
+std::atomic<int> anisotropy{1};
+int anisotropy_applied = 1;
+float anisotropy_max = 1.0f;
+std::vector<void (*)(int)> anisotropy_listeners;
 
 struct Tex { GLuint name = 0; int w = 0, h = 0, levels = 0; };
 std::unordered_map<uint32_t, Tex> texs;            // decoded textures, by id
@@ -391,6 +401,10 @@ void bind_textures() {
     static const GLint wrap[4] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT, GL_REPEAT};
     static const GLint minf[8] = {GL_NEAREST, GL_NEAREST_MIPMAP_NEAREST, GL_NEAREST_MIPMAP_LINEAR, GL_NEAREST,
                                   GL_LINEAR, GL_LINEAR_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR};
+    if (const int a = anisotropy.load(); a != anisotropy_applied) {
+        anisotropy_applied = a;
+        std::fill(std::begin(sampler_set), std::end(sampler_set), false);
+    }
     uint32_t used = used_maps();
     for (int m = 0; m < 8; ++m) {
         if (!(used >> m & 1)) continue;
@@ -414,6 +428,10 @@ void bind_textures() {
             glSamplerParameterf(s, GL_TEXTURE_LOD_BIAS, (float)(int8_t)(m0 >> 9 & 0xFF) / 32.0f);
             glSamplerParameterf(s, GL_TEXTURE_MIN_LOD, (float)(m1 & 0xFF) / 16.0f);
             glSamplerParameterf(s, GL_TEXTURE_MAX_LOD, (float)(m1 >> 8 & 0xFF) / 16.0f);
+            // only where the game filters linearly: a nearest texture stays sharp
+            const bool linear = (m0 >> 5 & 7) >= 4;
+            glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY,
+                                linear ? std::min((float)anisotropy_applied, anisotropy_max) : 1.0f);
             sampler_mode[m][0] = m0;
             sampler_mode[m][1] = m1;
             sampler_set[m] = true;
@@ -1293,6 +1311,8 @@ void setup() {
     glNamedBufferStorage(ps_ubo, sizeof(PSUniforms), nullptr, GL_DYNAMIC_STORAGE_BIT);
     glBindBufferBase(GL_UNIFORM_BUFFER, 1, ps_ubo);
     glCreateSamplers(8, samplers);
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &anisotropy_max);
+    if (anisotropy_max < 1.0f) anisotropy_max = 1.0f;
 
     copy_prog = link(FULLSCREEN_VS, COPY_FS);
     if (!copy_prog) rt_die("video: the EFB copy program does not build");
@@ -1537,3 +1557,10 @@ int video_scale_setting() {
     return r >= 0 ? r : scale_setting.load();
 }
 void video_on_scale(void (*on_change)(int scale)) { scale_listeners.push_back(on_change); }
+void video_set_anisotropy(int level) {
+    if (level < 1 || level > 16) return;
+    anisotropy = level;
+    for (auto f : anisotropy_listeners) f(level);
+}
+int video_anisotropy() { return anisotropy.load(); }
+void video_on_anisotropy(void (*on_change)(int level)) { anisotropy_listeners.push_back(on_change); }
