@@ -27,6 +27,10 @@ void rt_backtrace(const PPCContext& c, FILE* out, int max = 24);
 // the game starts. Its hooks come from the recompiler's --hooks file.
 struct RtGameLayer { RtGameLayer(const char* name, void (*install)()); };
 void rt_game_install();
+// The extracted tree wiiboot runs (its first argument), for a port that reads
+// its own data from it.
+void rt_set_game_root(const char* dir);
+const char* rt_game_root();
 
 // Registers of the guest code currently running on this host thread (for
 // crash reports and "who touched this register" logs). Set by the OS layer.

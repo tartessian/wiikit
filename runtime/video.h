@@ -103,3 +103,11 @@ void write_png(const std::string& path, int w, int h, const uint8_t* rgba);   //
 // Runs the window and the renderer on the calling thread (the process's main
 // thread) until the window is closed; the game runs on its own threads.
 void video_run(const char* title);
+
+// The port's own settings in the Esc menu: each item is a button whose label
+// the port gives (it may change: a toggle shows its state); choosing it runs
+// `choose` and shows the menu again. `on_pause` hears the menu open (true)
+// and close (false): the game stops meanwhile, and so should any sound the
+// port plays on its own.
+void video_add_menu_item(const char* (*label)(), void (*choose)());
+void video_on_pause(void (*on_pause)(bool paused));

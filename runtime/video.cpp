@@ -715,6 +715,10 @@ enum : uint32_t { CL_UP = 0x0001, CL_LEFT = 0x0002, CL_ZR = 0x0004, CL_X = 0x000
                   CL_Y = 0x0020, CL_B = 0x0040, CL_ZL = 0x0080, CL_R = 0x0200, CL_PLUS = 0x0400,
                   CL_HOME = 0x0800, CL_MINUS = 0x1000, CL_L = 0x2000, CL_DOWN = 0x4000, CL_RIGHT = 0x8000 };
 constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right, then R's: kStick << 0..7
+// the port's Esc menu items and pause listeners (video_add_menu_item, video_on_pause)
+struct MenuItem { const char* (*label)(); void (*choose)(); };
+std::vector<MenuItem> menu_items;
+std::vector<void (*)(bool)> pause_listeners;
 std::vector<Binding> bindings;
 int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
 bool face_by_label = false;                         // the key file's Face Buttons = Label
@@ -1367,14 +1371,23 @@ void video_run(const char* title) {
             // While it is open the renderer stops, and the game with it as
             // soon as its FIFO record queue is full.
             if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_ESCAPE && !e.key.repeat) {
-                const SDL_MessageBoxButtonData buttons[] = {
-                    {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "Resume"},
-                    {0, 1, "Quit"}};
-                SDL_MessageBoxData box = {SDL_MESSAGEBOX_INFORMATION, win, base_title.c_str(), "Paused.",
-                                          2, buttons, nullptr};
-                int choice = 0;
                 SDL_SetWindowRelativeMouseMode(win, false);
-                if (SDL_ShowMessageBox(&box, &choice) && choice == 1) quit = true;
+                for (auto f : pause_listeners) f(true);
+                for (;;) {                                // the port's items show the menu again
+                    std::vector<SDL_MessageBoxButtonData> buttons = {
+                        {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "Resume"}};
+                    for (size_t k = 0; k < menu_items.size(); ++k)
+                        buttons.push_back({0, (int)(2 + k), menu_items[k].label()});
+                    buttons.push_back({0, 1, "Quit"});
+                    SDL_MessageBoxData box = {SDL_MESSAGEBOX_INFORMATION, win, base_title.c_str(), "Paused.",
+                                              (int)buttons.size(), buttons.data(), nullptr};
+                    int choice = 0;
+                    if (!SDL_ShowMessageBox(&box, &choice)) break;
+                    if (choice == 1) quit = true;
+                    if (choice < 2) break;
+                    menu_items[choice - 2].choose();
+                }
+                for (auto f : pause_listeners) f(false);
             }
         }
         auto now = Clock::now();
@@ -1447,3 +1460,6 @@ void video_run(const char* title) {
         if (!busy) SDL_WaitSemaphoreTimeout(wake, 5);
     }
 }
+
+void video_add_menu_item(const char* (*label)(), void (*choose)()) { menu_items.push_back({label, choose}); }
+void video_on_pause(void (*on_pause)(bool paused)) { pause_listeners.push_back(on_pause); }

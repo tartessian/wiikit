@@ -109,6 +109,10 @@ std::vector<Layer>& layers() { static std::vector<Layer> v; return v; }   // fil
 
 RtGameLayer::RtGameLayer(const char* name, void (*install)()) { layers().push_back({name, install}); }
 
+static std::string g_game_root;
+void rt_set_game_root(const char* dir) { g_game_root = dir; }
+const char* rt_game_root() { return g_game_root.c_str(); }
+
 void rt_game_install() {
     for (const Layer& l : layers()) {
         rt_log("wiiboot: game layer %s", l.name);
