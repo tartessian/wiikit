@@ -136,3 +136,10 @@ void video_on_scale(void (*on_change)(int scale));
 void video_set_anisotropy(int level);
 int video_anisotropy();
 void video_on_anisotropy(void (*on_change)(int level));
+
+// Ambient occlusion, not the console's: 0 off, 1 low, 2 high. It darkens the
+// 3D scene where surfaces meet, from the EFB's depth, before the game's 2D
+// layer; see video.cpp. Any thread may ask. `on_change` hears changes.
+void video_set_ambient_occlusion(int level);
+int video_ambient_occlusion();
+void video_on_ambient_occlusion(void (*on_change)(int level));

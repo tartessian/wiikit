@@ -264,6 +264,205 @@ void efb_dump(const char* tag) {
     write_png(name, EFB_W * S, EFB_H * S, px.data());
 }
 
+// ---- ambient occlusion ---------------------------------------------------------------------
+// Not the console's: an addition a port may offer (video_set_ambient_occlusion).
+// It darkens the 3D scene where surfaces meet, from the EFB's depth, once a
+// frame, as engines do between their opaque and transparent geometry: at the
+// first draw after the opaque scene that is transparent (blended, writing no
+// depth) or orthographic (the 2D layer), or at the copy to the XFB if there is
+// neither, so particles, a fade or a HUD drawn over the scene stay as they
+// were. Only a
+// perspective viewport that covers most of the EFB counts as the scene: an
+// off-screen pass (a reflection, a shadow) is left alone.
+//
+// Depth to view space: the vertex shader writes farZ + zRange * (p4 z + p5) / -z
+// (in units of 2^24), which inverts to z = p5 / (-(d - farZ) / zRange - p4);
+// x and y follow from p0..p3 and the viewport, as a draw set them.
+// Three passes at the EFB's resolution: the occlusion (Scalable Ambient
+// Obscurance: samples on a spiral within a radius in view space), a
+// depth-aware blur across and down, and a multiply of the EFB's color.
+std::atomic<int> ao_level{0};                    // 0 off, 1 low, 2 high
+std::vector<void (*)(int)> ao_listeners;
+struct AoView { float p[6], far_z, z_range, vp[4], flip[2]; };
+AoView ao_view;
+int ao_scene_draws = 0;                          // perspective draws of the scene since the last copy
+bool ao_done = false;
+GLuint ao_prog = 0, ao_blur_prog = 0, ao_apply_prog = 0, ao_tex[2] = {}, ao_fbo[2] = {}, ao_apply_fbo = 0;
+int ao_w = 0, ao_h = 0;
+
+const char* AO_FS = R"(#version 450 core
+layout(binding = 8) uniform sampler2D depth_tex;
+uniform vec4 proj;     // p0 p1 p2 p3
+uniform vec4 proj2;    // p4 p5 farZ zRange
+uniform vec4 vp;       // the viewport, in pixels
+uniform vec4 params;   // radius, intensity, samples, largest radius in pixels
+uniform vec4 flip;     // the viewport's signs
+out float ao;
+vec3 view_pos(vec2 frag, float d) {
+    vec2 ndc = ((frag - vp.xy) / vp.zw * 2.0 - 1.0) * flip.xy;
+    float z = proj2.y / (-(d - proj2.z) / proj2.w - proj2.x);
+    return vec3(-z * (ndc.x + proj.y) / proj.x, -z * (ndc.y + proj.w) / proj.z, z);
+}
+float depth_at(vec2 q) { return texelFetch(depth_tex, ivec2(q), 0).r; }
+void main() {
+    vec2 f = gl_FragCoord.xy;
+    float d = depth_at(f);
+    ao = 1.0;
+    if (d >= 0.99999) return;
+    vec3 P = view_pos(f, d);
+    if (P.z >= 0.0) return;
+    vec3 pr = view_pos(f + vec2(1, 0), depth_at(f + vec2(1, 0))), pl = view_pos(f - vec2(1, 0), depth_at(f - vec2(1, 0)));
+    vec3 pu = view_pos(f + vec2(0, 1), depth_at(f + vec2(0, 1))), pd = view_pos(f - vec2(0, 1), depth_at(f - vec2(0, 1)));
+    vec3 dx = abs(pr.z - P.z) < abs(P.z - pl.z) ? pr - P : P - pl;
+    vec3 dy = abs(pu.z - P.z) < abs(P.z - pd.z) ? pu - P : P - pd;
+    vec3 n = normalize(cross(dx, dy));
+    if (dot(n, P) > 0.0) n = -n;
+    float radius = params.x;
+    float rpix = min(radius * abs(proj.x) * vp.z * 0.5 / -P.z, params.w);
+    if (rpix < 2.0) return;
+    int count = int(params.z);
+    float noise = fract(52.9829189 * fract(dot(f, vec2(0.06711056, 0.00583715))));
+    float sum = 0.0, r2 = radius * radius;
+    for (int i = 0; i < count; ++i) {
+        float t = (float(i) + 0.5) / float(count);
+        float a = (t * 7.0 + noise) * 6.2831853;
+        vec2 q = f + vec2(cos(a), sin(a)) * t * rpix;
+        if (any(lessThan(q, vp.xy)) || any(greaterThanEqual(q, vp.xy + vp.zw))) continue;
+        float dq = depth_at(q);
+        if (dq >= 0.99999) continue;
+        vec3 v = view_pos(q, dq) - P;
+        float vv = dot(v, v), vn = dot(v, n);
+        float fall = max(r2 - vv, 0.0);
+        sum += fall * fall * fall * max((vn + 0.002 * P.z) / (vv + 0.01 * r2), 0.0);
+    }
+    ao = clamp(1.0 - sum * params.y * 5.0 / (r2 * r2 * r2 * float(count)), 0.0, 1.0);
+}
+)";
+
+const char* AO_BLUR_FS = R"(#version 450 core
+layout(binding = 8) uniform sampler2D depth_tex;
+layout(binding = 9) uniform sampler2D ao_tex;
+uniform vec4 proj2;    // p4 p5 farZ zRange
+uniform ivec4 dir;     // the direction, and the step in pixels
+out float ao;
+float view_z(ivec2 q) {
+    float d = texelFetch(depth_tex, q, 0).r;
+    return proj2.y / (-(d - proj2.z) / proj2.w - proj2.x);
+}
+void main() {
+    ivec2 c = ivec2(gl_FragCoord.xy);
+    float z0 = view_z(c), sum = 0.0, weight = 0.0;
+    for (int k = -4; k <= 4; ++k) {
+        ivec2 q = c + dir.xy * k * dir.z;
+        float w = exp(-float(k * k) / 8.0) * max(0.0, 1.0 - abs(view_z(q) - z0) / (abs(z0) * 0.05 + 1e-4));
+        sum += texelFetch(ao_tex, q, 0).r * w;
+        weight += w;
+    }
+    ao = weight > 0.0 ? sum / weight : 1.0;
+}
+)";
+
+const char* AO_APPLY_FS = R"(#version 450 core
+layout(binding = 9) uniform sampler2D ao_tex;
+out vec4 color;
+void main() {
+    float a = texelFetch(ao_tex, ivec2(gl_FragCoord.xy), 0).r;
+    color = vec4(a, a, a, 1.0);
+}
+)";
+
+// what a perspective draw of the scene leaves for the occlusion
+void ao_note_draw() {
+    if (xf[0x1026] != 0) return;
+    const float wd = std::fabs(fx(0x101A)), ht = std::fabs(fx(0x101B));
+    if (2 * wd < EFB_W * 0.75f || 2 * ht < 400.0f) return;         // not the scene's viewport
+    const int offx = s10(bp[0x59]) * 2, offy = s10(bp[0x59] >> 10) * 2;
+    for (int i = 0; i < 6; ++i) ao_view.p[i] = fx(0x1020 + i);
+    ao_view.far_z = fx(0x101F) / 16777216.0f;
+    ao_view.z_range = fx(0x101C) / 16777216.0f;
+    ao_view.vp[0] = (fx(0x101D) - wd - (float)offx) * (float)S;
+    ao_view.vp[1] = (fx(0x101E) - ht - (float)offy) * (float)S;
+    ao_view.vp[2] = 2 * wd * (float)S;
+    ao_view.vp[3] = 2 * ht * (float)S;
+    ao_view.flip[0] = fx(0x101A) < 0 ? -1.0f : 1.0f;
+    ao_view.flip[1] = fx(0x101B) < 0 ? -1.0f : 1.0f;
+    ++ao_scene_draws;
+}
+
+void ao_apply() {
+    ao_done = true;
+    const int level = ao_level.load();
+    if (!level || !ao_scene_draws || ao_view.z_range == 0.0f || ao_view.p[0] == 0.0f || ao_view.p[2] == 0.0f) return;
+    if (!ao_prog) {
+        ao_prog = link(FULLSCREEN_VS, AO_FS);
+        ao_blur_prog = link(FULLSCREEN_VS, AO_BLUR_FS);
+        ao_apply_prog = link(FULLSCREEN_VS, AO_APPLY_FS);
+        if (!ao_prog || !ao_blur_prog || !ao_apply_prog) { ao_level = 0; rt_log("video: no ambient occlusion"); return; }
+        glCreateFramebuffers(2, ao_fbo);
+        glCreateFramebuffers(1, &ao_apply_fbo);
+    }
+    const int w = EFB_W * S, h = EFB_H * S;
+    if (w != ao_w || h != ao_h) {
+        for (int i = 0; i < 2; ++i) {
+            if (ao_tex[i]) glDeleteTextures(1, &ao_tex[i]);
+            glCreateTextures(GL_TEXTURE_2D, 1, &ao_tex[i]);
+            glTextureStorage2D(ao_tex[i], 1, GL_R8, w, h);
+            glNamedFramebufferTexture(ao_fbo[i], GL_COLOR_ATTACHMENT0, ao_tex[i], 0);
+        }
+        ao_w = w;
+        ao_h = h;
+    }
+    glNamedFramebufferTexture(ao_apply_fbo, GL_COLOR_ATTACHMENT0, efb_col, 0);   // the EFB may be new
+
+    const AoView& v = ao_view;
+    const float radius = level == 1 ? 0.5f : 0.8f, intensity = level == 1 ? 0.7f : 1.0f;
+    const float samples = level == 1 ? 10.0f : 20.0f;
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glColorMask(1, 1, 1, 1);
+    glViewport(0, 0, w, h);
+    glBindVertexArray(empty_vao);
+    glBindTextureUnit(8, efb_dep);
+    glBindSampler(8, 0);
+    glBindSampler(9, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ao_fbo[0]);                     // the occlusion
+    glUseProgram(ao_prog);
+    glProgramUniform4f(ao_prog, glGetUniformLocation(ao_prog, "proj"), v.p[0], v.p[1], v.p[2], v.p[3]);
+    glProgramUniform4f(ao_prog, glGetUniformLocation(ao_prog, "proj2"), v.p[4], v.p[5], v.far_z, v.z_range);
+    glProgramUniform4f(ao_prog, glGetUniformLocation(ao_prog, "vp"), v.vp[0], v.vp[1], v.vp[2], v.vp[3]);
+    glProgramUniform4f(ao_prog, glGetUniformLocation(ao_prog, "params"), radius, intensity, samples, 48.0f * (float)S);
+    glProgramUniform4f(ao_prog, glGetUniformLocation(ao_prog, "flip"), v.flip[0], v.flip[1], 0, 0);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glUseProgram(ao_blur_prog);                                       // the blur, across then down
+    glProgramUniform4f(ao_blur_prog, glGetUniformLocation(ao_blur_prog, "proj2"), v.p[4], v.p[5], v.far_z, v.z_range);
+    const GLint dir = glGetUniformLocation(ao_blur_prog, "dir");
+    for (int pass = 0; pass < 2; ++pass) {
+        glBindFramebuffer(GL_FRAMEBUFFER, ao_fbo[1 - pass]);
+        glBindTextureUnit(9, ao_tex[pass]);
+        glProgramUniform4i(ao_blur_prog, dir, pass == 0, pass == 1, std::max(1, S / 2), 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ao_apply_fbo);                  // the EFB's color, times the occlusion
+    glUseProgram(ao_apply_prog);
+    glBindTextureUnit(9, ao_tex[0]);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor((GLint)v.vp[0], (GLint)v.vp[1], (GLsizei)v.vp[2], (GLsizei)v.vp[3]);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_ZERO, GL_SRC_COLOR, GL_ZERO, GL_ONE);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glBindVertexArray(vao);
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+}
+
 void efb_copy(uint32_t v) {
     int x = (int)(bp[0x49] & 0x3FF), y = (int)(bp[0x49] >> 10 & 0x3FF);
     int w = (int)(bp[0x4A] & 0x3FF) + 1, h = (int)(bp[0x4A] >> 10 & 0x3FF) + 1;
@@ -275,6 +474,7 @@ void efb_copy(uint32_t v) {
         efb_dump(tag);
     }
     if (v >> 14 & 1) {                                           // to the XFB
+        if (!ao_done) ao_apply();
         Tex& t = xfbs[dest];
         ensure_tex(t, w * S, h * S, 1);
         glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
@@ -309,6 +509,8 @@ void efb_copy(uint32_t v) {
         glBindVertexArray(vao);
     }
     if (v >> 11 & 1) efb_clear(x, y, w, h);
+    ao_scene_draws = 0;                                          // a new frame, or a new pass
+    ao_done = false;
 }
 
 void bp_set(uint32_t v) {
@@ -454,6 +656,11 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
     GLuint prog = program_for(vflags);
     if (!prog) return;
     ++cnt.draws;
+    // before what is not the opaque scene: the 2D layer, or the transparent
+    // queue (blended, writing no depth: particles, glass, a fade drawn in 3D)
+    const bool transparent = (bp[0x41] & 1) && !(bp[0x40] >> 4 & 1);
+    if (!ao_done && ao_scene_draws && (xf[0x1026] != 0 || transparent)) ao_apply();
+    else if (!transparent) ao_note_draw();
     glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
     glUseProgram(prog);
 
@@ -1564,3 +1771,10 @@ void video_set_anisotropy(int level) {
 }
 int video_anisotropy() { return anisotropy.load(); }
 void video_on_anisotropy(void (*on_change)(int level)) { anisotropy_listeners.push_back(on_change); }
+void video_set_ambient_occlusion(int level) {
+    if (level < 0 || level > 2) return;
+    ao_level = level;
+    for (auto f : ao_listeners) f(level);
+}
+int video_ambient_occlusion() { return ao_level.load(); }
+void video_on_ambient_occlusion(void (*on_change)(int level)) { ao_listeners.push_back(on_change); }

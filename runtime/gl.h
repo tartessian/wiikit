@@ -45,6 +45,7 @@
     X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation)                                            \
     X(PFNGLPROGRAMUNIFORM1IPROC, glProgramUniform1i)                                                \
     X(PFNGLPROGRAMUNIFORM4IPROC, glProgramUniform4i)                                                \
+    X(PFNGLPROGRAMUNIFORM4FPROC, glProgramUniform4f)                                                \
     X(PFNGLCREATEBUFFERSPROC, glCreateBuffers)                                                      \
     X(PFNGLNAMEDBUFFERSTORAGEPROC, glNamedBufferStorage)                                            \
     X(PFNGLNAMEDBUFFERSUBDATAPROC, glNamedBufferSubData)                                            \
