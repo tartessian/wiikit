@@ -17,10 +17,19 @@
 //     call: call it, then return; to any other address it continues here
 //   * backward branches poll for interrupts, as recompiled loops do
 //
-// Instructions are decoded from guest memory each time they run: code that
-// is rewritten needs nothing from its writer here.
+// Straight runs of code (up to a branch) are decoded once into blocks: the
+// frequent instructions with their fields worked out and a handler each,
+// dispatched one to the next (computed goto, so that each handler's jump has
+// its own history in the branch predictor), the rest through step(), which
+// knows every instruction. A block keeps the words it was decoded from and
+// is checked against memory each time it is entered, so code that is
+// rewritten needs nothing from its writer here, as before.
 #include "rt.h"
 #include <cmath>
+#include <cstring>
+#include <memory>
+#include <cstddef>
+#include <vector>
 
 namespace {
 
@@ -58,9 +67,15 @@ inline bool global_spr(uint32_t n) {
 
 }  // namespace
 
-void interp_call(PPCContext& c, uint32_t pc) {
-    for (;;) {
-        const uint32_t w = ld32(pc);
+namespace {
+
+enum Flow : uint8_t { F_NEXT, F_JUMP, F_RETURN };
+struct Step { Flow flow; uint32_t target; };
+
+// One instruction at pc, word w: on to the next, a jump without link (to
+// `target`), or a return
+Step step(PPCContext& c, const uint32_t pc, const uint32_t w) {
+    {
         const uint32_t nxt = pc + 4;
         const uint32_t op = w >> 26;
         const uint32_t D = (w >> 21) & 31, A = (w >> 16) & 31, B = (w >> 11) & 31, C = (w >> 6) & 31;
@@ -108,7 +123,7 @@ void interp_call(PPCContext& c, uint32_t pc) {
                     ppc_call_indirect(c, t);
                     break;
                 }
-                return;
+                return {F_RETURN, 0};
             case 528:                                 // bcctr
                 if (!bc_taken(c, D, A)) break;
                 if (w & 1) {
@@ -133,7 +148,7 @@ void interp_call(PPCContext& c, uint32_t pc) {
             case 289: c.cr[D] = (uint8_t)((!(c.cr[A] ^ c.cr[B])) & 1); break;     // creqv
             case 50:                                  // rfi
                 ppc_unimplemented(c, pc, "rfi");
-                return;
+                return {F_RETURN, 0};
             default: bad(c, pc, w);
             }
             break;
@@ -514,15 +529,384 @@ void interp_call(PPCContext& c, uint32_t pc) {
             bad(c, pc, w);
         }
 
-        if (!jump) {
-            pc = nxt;
-            continue;
+        return jump ? Step{F_JUMP, target} : Step{F_NEXT, 0};
+    }
+}
+
+// ---- blocks ----------------------------------------------------------------------------------
+enum Kind : uint16_t {
+    K_END,                                         // past the block's last instruction
+    K_STEP,                                        // step(), then on in the block
+    K_TERM,                                        // step(), and the block ends: branches, and what may run guest code
+    K_LI, K_ADDI, K_ORI, K_XORI, K_ANDI, K_CMPWI, K_CMPLWI, K_RLWINM,
+    K_LWZ, K_LBZ, K_LHZ, K_LHA, K_STW, K_STB, K_STH, K_STWU,
+    K_LFS, K_LFD, K_STFS, K_STFD,
+    K_OR, K_AND, K_XOR, K_ADD, K_SUBF, K_NEG, K_MULLW, K_SLW, K_SRW, K_SRAWI, K_EXTSH, K_EXTSB,
+    K_CMPW, K_CMPLW, K_LWZX, K_STWX, K_LBZX, K_STBX,
+    K_MFLR, K_MTLR, K_MFCTR, K_MTCTR,
+    K_FMR, K_FNEG, K_FADD, K_FSUB, K_FMUL, K_FADDS, K_FSUBS, K_FMULS, K_FMADDS, K_FMSUBS, K_FCMPU, K_FRSP,
+    K_ADDIC,
+    K_B, K_BL, K_BC, K_BLR,                        // branches (the block ends): imm is the target
+    K_COUNT
+};
+
+struct Op {
+    uint16_t kind;
+    uint8_t d, a, b, cc;                           // cc: C, or a CR field
+    uint32_t imm;                                  // an immediate, a mask
+    uint32_t w;
+};
+
+struct Block {
+    uint32_t start, n;                             // n instructions, their words after the ops
+    Op ops[1];                                     // n + 1: a K_END closes them
+    const uint8_t* words() const { return reinterpret_cast<const uint8_t*>(ops + n + 1); }
+};
+
+inline bool ends_block(uint16_t kind) { return kind == K_TERM || (kind >= K_B && kind <= K_BLR); }
+
+// The kind of the instruction with word w at pc, and its fields
+Op classify(uint32_t w, uint32_t pc) {
+    const uint32_t op = w >> 26, D = (w >> 21) & 31, A = (w >> 16) & 31, B = (w >> 11) & 31, C = (w >> 6) & 31;
+    const bool rc = w & 1;
+    Op o{K_STEP, (uint8_t)D, (uint8_t)A, (uint8_t)B, (uint8_t)C, 0, w};
+    auto k = [&](Kind kind, uint32_t imm = 0) { o.kind = kind; o.imm = imm; return o; };
+    switch (op) {
+    case 18: {                                                              // b, bl
+        uint32_t li = w & 0x03FFFFFC;
+        if (li & 0x02000000) li |= 0xFC000000;
+        const uint32_t t = (w & 2) ? li : pc + li;
+        return k((w & 1) ? K_BL : K_B, t);
+    }
+    case 16: {                                                              // bc (bcl: step())
+        if (w & 1) return k(K_TERM);
+        uint32_t bd = w & 0xFFFC;
+        if (bd & 0x8000) bd |= 0xFFFF0000;
+        return k(K_BC, (w & 2) ? bd : pc + bd);
+    }
+    case 19:                                                                // blr; the rest of 19: step()
+        return ((w >> 1) & 0x3FF) == 16 && !(w & 1) && (D & 0x14) == 0x14 ? k(K_BLR) : k(K_TERM);
+    case 17: case 3: return k(K_TERM);                                      // sc, twi
+    case 12: return k(K_ADDIC, s16(w));
+    case 14: return A ? k(K_ADDI, s16(w)) : k(K_LI, s16(w));
+    case 15: return A ? k(K_ADDI, w << 16) : k(K_LI, w << 16);
+    case 24: return k(K_ORI, w & 0xFFFF);
+    case 25: return k(K_ORI, w << 16);
+    case 26: return k(K_XORI, w & 0xFFFF);
+    case 27: return k(K_XORI, w << 16);
+    case 28: return k(K_ANDI, w & 0xFFFF);
+    case 29: return k(K_ANDI, w << 16);
+    case 11: o.cc = (uint8_t)((w >> 23) & 7); return k(K_CMPWI, s16(w));
+    case 10: o.cc = (uint8_t)((w >> 23) & 7); return k(K_CMPLWI, w & 0xFFFF);
+    case 21: return rc ? o : k(K_RLWINM, mask32(C, (w >> 1) & 31));
+    // D-form loads and stores based on a register (rA = 0 is an address: step())
+    case 32: return A ? k(K_LWZ, s16(w)) : o;
+    case 34: return A ? k(K_LBZ, s16(w)) : o;
+    case 40: return A ? k(K_LHZ, s16(w)) : o;
+    case 42: return A ? k(K_LHA, s16(w)) : o;
+    case 36: return A ? k(K_STW, s16(w)) : o;
+    case 38: return A ? k(K_STB, s16(w)) : o;
+    case 44: return A ? k(K_STH, s16(w)) : o;
+    case 37: return k(K_STWU, s16(w));
+    case 48: return A ? k(K_LFS, s16(w)) : o;
+    case 50: return A ? k(K_LFD, s16(w)) : o;
+    case 52: return A ? k(K_STFS, s16(w)) : o;
+    case 54: return A ? k(K_STFD, s16(w)) : o;
+    case 31: {
+        const uint32_t xo = (w >> 1) & 0x3FF;
+        switch (xo) {
+        case 4: case 146: return k(K_TERM);                                 // tw, mtmsr
+        case 0: o.cc = (uint8_t)((w >> 23) & 7); return k(K_CMPW);
+        case 32: o.cc = (uint8_t)((w >> 23) & 7); return k(K_CMPLW);
+        case 23: return k(K_LWZX);
+        case 151: return k(K_STWX);
+        case 87: return k(K_LBZX);
+        case 215: return k(K_STBX);
+        case 339: {
+            const uint32_t n = A | B << 5;
+            return n == 8 ? k(K_MFLR) : n == 9 ? k(K_MFCTR) : o;
         }
-        if (PPCFunc f = ppc_lookup(target)) {         // a tail call into recompiled code
+        case 467: {
+            const uint32_t n = A | B << 5;
+            return n == 8 ? k(K_MTLR) : n == 9 ? k(K_MTCTR) : o;
+        }
+        }
+        if (rc) return o;
+        switch (xo) {
+        case 444: return k(K_OR);
+        case 28: return k(K_AND);
+        case 316: return k(K_XOR);
+        case 266: return k(K_ADD);
+        case 40: return k(K_SUBF);
+        case 104: return k(K_NEG);
+        case 235: return k(K_MULLW);
+        case 24: return k(K_SLW);
+        case 536: return k(K_SRW);
+        case 824: return k(K_SRAWI);
+        case 922: return k(K_EXTSH);
+        case 954: return k(K_EXTSB);
+        }
+        return o;
+    }
+    case 59:
+        if (rc) return o;
+        switch ((w >> 1) & 31) {
+        case 21: return k(K_FADDS);
+        case 20: return k(K_FSUBS);
+        case 25: return k(K_FMULS);
+        case 29: return k(K_FMADDS);
+        case 28: return k(K_FMSUBS);
+        }
+        return o;
+    case 63: {
+        const uint32_t xo = (w >> 1) & 0x3FF;
+        if (xo == 0) { o.cc = (uint8_t)((w >> 23) & 7); return k(K_FCMPU); }
+        if (rc) return o;
+        switch (xo) {
+        case 72: return k(K_FMR);
+        case 40: return k(K_FNEG);
+        case 12: return k(K_FRSP);
+        }
+        switch (xo & 31) {
+        case 21: return xo == 21 ? k(K_FADD) : o;
+        case 20: return xo == 20 ? k(K_FSUB) : o;
+        case 25: return (xo & ~(31u << 5)) == 25 ? k(K_FMUL) : o;          // C is in the xo's top bits
+        }
+        return o;
+    }
+    }
+    return o;
+}
+
+constexpr uint32_t kMaxOps = 32;
+
+// Blocks by address (direct-mapped), in arenas per host thread. A block
+// stays where it is while any interp_call of the thread may be running it:
+// the arenas are only emptied from the outermost one, between blocks.
+struct Blocks {
+    static constexpr size_t kSlots = 16384, kArena = 8u << 20;
+    Block* slot[kSlots] = {};
+    std::vector<std::unique_ptr<uint8_t[]>> arenas;
+    size_t used = kArena;
+    int depth = 0;
+    void* alloc(size_t n) {
+        n = (n + 15) & ~size_t(15);
+        if (used + n > kArena) {
+            arenas.emplace_back(new uint8_t[kArena]);
+            used = 0;
+        }
+        void* p = arenas.back().get() + used;
+        used += n;
+        return p;
+    }
+    void reset() {
+        std::memset(slot, 0, sizeof slot);
+        arenas.resize(1);
+        used = 0;
+    }
+};
+
+Blocks& blocks() {
+    static thread_local std::unique_ptr<Blocks> b;
+    if (!b) b.reset(new Blocks);
+    return *b;
+}
+
+// Whether memory still holds a block's words (inline: most blocks are a few words)
+inline bool same_words(const uint8_t* a, const uint8_t* b, uint32_t n) {
+    uint32_t i = 0;
+    for (; i + 2 <= n; i += 2) {
+        uint64_t x, y;
+        std::memcpy(&x, a + 4 * i, 8);
+        std::memcpy(&y, b + 4 * i, 8);
+        if (x != y) return false;
+    }
+    if (i < n) {
+        uint32_t x, y;
+        std::memcpy(&x, a + 4 * i, 4);
+        std::memcpy(&y, b + 4 * i, 4);
+        if (x != y) return false;
+    }
+    return true;
+}
+
+// The block at pc, as memory holds it now
+const Block* block_at(Blocks& bs, const uint8_t* mem, uint32_t pc) {
+    Block*& s = bs.slot[(pc >> 2) & (Blocks::kSlots - 1)];
+    if (s && s->start == pc && same_words(mem + pc, s->words(), s->n)) return s;
+    if (bs.depth == 1 && bs.arenas.size() > 4) bs.reset();          // nothing of them runs now
+    Op ops[kMaxOps + 1];
+    uint32_t n = 0;
+    while (n < kMaxOps) {
+        uint32_t raw;
+        std::memcpy(&raw, mem + pc + 4 * n, 4);
+        ops[n] = classify(PPC_BSWAP32(raw), pc + 4 * n);
+        if (ends_block(ops[n++].kind)) break;
+    }
+    ops[n] = Op{K_END, 0, 0, 0, 0, 0, 0};
+    Block* b = static_cast<Block*>(bs.alloc(offsetof(Block, ops) + sizeof(Op) * (n + 1) + 4 * n));
+    b->start = pc;
+    b->n = n;
+    std::memcpy(b->ops, ops, sizeof(Op) * (n + 1));
+    std::memcpy(const_cast<uint8_t*>(b->words()), mem + pc, 4 * n);
+    s = b;
+    return b;
+}
+
+}  // namespace
+
+void interp_call(PPCContext& c, uint32_t pc) {
+    static void* const labels[K_COUNT] = {
+        &&L_END, &&L_STEP, &&L_TERM,
+        &&L_LI, &&L_ADDI, &&L_ORI, &&L_XORI, &&L_ANDI, &&L_CMPWI, &&L_CMPLWI, &&L_RLWINM,
+        &&L_LWZ, &&L_LBZ, &&L_LHZ, &&L_LHA, &&L_STW, &&L_STB, &&L_STH, &&L_STWU,
+        &&L_LFS, &&L_LFD, &&L_STFS, &&L_STFD,
+        &&L_OR, &&L_AND, &&L_XOR, &&L_ADD, &&L_SUBF, &&L_NEG, &&L_MULLW, &&L_SLW, &&L_SRW, &&L_SRAWI,
+        &&L_EXTSH, &&L_EXTSB,
+        &&L_CMPW, &&L_CMPLW, &&L_LWZX, &&L_STWX, &&L_LBZX, &&L_STBX,
+        &&L_MFLR, &&L_MTLR, &&L_MFCTR, &&L_MTCTR,
+        &&L_FMR, &&L_FNEG, &&L_FADD, &&L_FSUB, &&L_FMUL, &&L_FADDS, &&L_FSUBS, &&L_FMULS, &&L_FMADDS,
+        &&L_FMSUBS, &&L_FCMPU, &&L_FRSP,
+        &&L_ADDIC,
+        &&L_B, &&L_BL, &&L_BC, &&L_BLR,
+    };
+    // the code is in RAM (ppc_call_indirect checks), and g_mem does not move
+    const uint8_t* const mem = g_mem;
+    Blocks& bs = blocks();
+    struct Depth {
+        Blocks& bs;
+        explicit Depth(Blocks& b) : bs(b) { ++bs.depth; }
+        ~Depth() { --bs.depth; }
+    } depth(bs);
+#define NEXT do { ++o; goto *labels[o->kind]; } while (0)
+    for (;;) {
+        const Block* b = block_at(bs, mem, pc);
+        const uint32_t start = b->start;
+        const Op* o = b->ops;
+        uint32_t ipc, target;
+        goto *labels[o->kind];
+
+    L_END:                                         // the block ran out without a branch
+        pc = start + 4 * (uint32_t)(o - b->ops);
+        continue;
+    L_STEP: {
+        const Step r = step(c, start + 4 * (uint32_t)(o - b->ops), o->w);
+        if (PPC_UNLIKELY(r.flow != F_NEXT)) {      // (not for these kinds; as step() says anyway)
+            ipc = start + 4 * (uint32_t)(o - b->ops);
+            if (r.flow == F_RETURN) return;
+            target = r.target;
+            goto jump;
+        }
+        NEXT;
+    }
+    L_TERM: {
+        // step() may run guest code (calls, syscalls, traps): nothing of this
+        // block after it, which that code may have rewritten
+        ipc = start + 4 * (uint32_t)(o - b->ops);
+        const Step r = step(c, ipc, o->w);
+        if (r.flow == F_NEXT) { pc = ipc + 4; continue; }
+        if (r.flow == F_RETURN) return;
+        target = r.target;
+        goto jump;
+    }
+
+    L_LI: c.r[o->d] = o->imm; NEXT;
+    L_ADDI: c.r[o->d] = c.r[o->a] + o->imm; NEXT;
+    L_ORI: c.r[o->a] = c.r[o->d] | o->imm; NEXT;
+    L_XORI: c.r[o->a] = c.r[o->d] ^ o->imm; NEXT;
+    L_ANDI: c.r[o->a] = c.r[o->d] & o->imm; cr0_rc(c, c.r[o->a]); NEXT;
+    L_CMPWI: cr_cmp_s(c, o->cc, (int32_t)c.r[o->a], (int32_t)o->imm); NEXT;
+    L_CMPLWI: cr_cmp_u(c, o->cc, c.r[o->a], o->imm); NEXT;
+    L_RLWINM: c.r[o->a] = rotl32(c.r[o->d], o->b) & o->imm; NEXT;
+
+    L_LWZ: c.r[o->d] = ld32(c.r[o->a] + o->imm); NEXT;
+    L_LBZ: c.r[o->d] = ld8(c.r[o->a] + o->imm); NEXT;
+    L_LHZ: c.r[o->d] = ld16(c.r[o->a] + o->imm); NEXT;
+    L_LHA: c.r[o->d] = (uint32_t)(int32_t)(int16_t)ld16(c.r[o->a] + o->imm); NEXT;
+    L_STW: st32(c.r[o->a] + o->imm, c.r[o->d]); NEXT;
+    L_STB: st8(c.r[o->a] + o->imm, (uint8_t)c.r[o->d]); NEXT;
+    L_STH: st16(c.r[o->a] + o->imm, (uint16_t)c.r[o->d]); NEXT;
+    L_STWU: {
+        const uint32_t ea = c.r[o->a] + o->imm;
+        st32(ea, c.r[o->d]);
+        c.r[o->a] = ea;
+        NEXT;
+    }
+    L_LFS: {
+        const double v = (double)as_f32(ld32(c.r[o->a] + o->imm));
+        c.f[o->d] = v;
+        c.ps1[o->d] = v;
+        NEXT;
+    }
+    L_LFD: c.f[o->d] = as_f64(ld64(c.r[o->a] + o->imm)); NEXT;
+    L_STFS: st32(c.r[o->a] + o->imm, as_u32((float)c.f[o->d])); NEXT;
+    L_STFD: st64(c.r[o->a] + o->imm, as_u64(c.f[o->d])); NEXT;
+
+    L_OR: c.r[o->a] = c.r[o->d] | c.r[o->b]; NEXT;
+    L_AND: c.r[o->a] = c.r[o->d] & c.r[o->b]; NEXT;
+    L_XOR: c.r[o->a] = c.r[o->d] ^ c.r[o->b]; NEXT;
+    L_ADD: c.r[o->d] = c.r[o->a] + c.r[o->b]; NEXT;
+    L_SUBF: c.r[o->d] = c.r[o->b] - c.r[o->a]; NEXT;
+    L_NEG: c.r[o->d] = 0u - c.r[o->a]; NEXT;
+    L_MULLW: c.r[o->d] = (uint32_t)((int64_t)(int32_t)c.r[o->a] * (int32_t)c.r[o->b]); NEXT;
+    L_SLW: c.r[o->a] = slw(c.r[o->d], c.r[o->b]); NEXT;
+    L_SRW: c.r[o->a] = srw(c.r[o->d], c.r[o->b]); NEXT;
+    L_SRAWI: c.r[o->a] = sraw(c, c.r[o->d], o->b); NEXT;
+    L_EXTSH: c.r[o->a] = (uint32_t)(int32_t)(int16_t)c.r[o->d]; NEXT;
+    L_EXTSB: c.r[o->a] = (uint32_t)(int32_t)(int8_t)c.r[o->d]; NEXT;
+    L_CMPW: cr_cmp_s(c, o->cc, (int32_t)c.r[o->a], (int32_t)c.r[o->b]); NEXT;
+    L_CMPLW: cr_cmp_u(c, o->cc, c.r[o->a], c.r[o->b]); NEXT;
+    L_LWZX: c.r[o->d] = ld32((o->a ? c.r[o->a] : 0) + c.r[o->b]); NEXT;
+    L_STWX: st32((o->a ? c.r[o->a] : 0) + c.r[o->b], c.r[o->d]); NEXT;
+    L_LBZX: c.r[o->d] = ld8((o->a ? c.r[o->a] : 0) + c.r[o->b]); NEXT;
+    L_STBX: st8((o->a ? c.r[o->a] : 0) + c.r[o->b], (uint8_t)c.r[o->d]); NEXT;
+    L_MFLR: c.r[o->d] = c.lr; NEXT;
+    L_MTLR: c.lr = c.r[o->d]; NEXT;
+    L_MFCTR: c.r[o->d] = c.ctr; NEXT;
+    L_MTCTR: c.ctr = c.r[o->d]; NEXT;
+
+    L_FMR: c.f[o->d] = c.f[o->b]; NEXT;
+    L_FNEG: c.f[o->d] = -c.f[o->b]; NEXT;
+    L_FADD: c.f[o->d] = c.f[o->a] + c.f[o->b]; NEXT;
+    L_FSUB: c.f[o->d] = c.f[o->a] - c.f[o->b]; NEXT;
+    L_FMUL: c.f[o->d] = c.f[o->a] * c.f[o->cc]; NEXT;
+    L_FADDS: fp_single(c, o->d, c.f[o->a] + c.f[o->b]); NEXT;
+    L_FSUBS: fp_single(c, o->d, c.f[o->a] - c.f[o->b]); NEXT;
+    L_FMULS: fp_single(c, o->d, c.f[o->a] * c.f[o->cc]); NEXT;
+    L_FMADDS: fp_single(c, o->d, c.f[o->a] * c.f[o->cc] + c.f[o->b]); NEXT;
+    L_FMSUBS: fp_single(c, o->d, c.f[o->a] * c.f[o->cc] - c.f[o->b]); NEXT;
+    L_FCMPU: fcmp(c, o->cc, c.f[o->a], c.f[o->b]); NEXT;
+    L_FRSP: fp_single(c, o->d, c.f[o->b]); NEXT;
+    L_ADDIC: c.r[o->d] = add_ca(c, c.r[o->a], o->imm, 0); NEXT;
+
+    L_B:
+        ipc = start + 4 * (uint32_t)(o - b->ops);
+        target = o->imm;
+        goto jump;
+    L_BL:                                          // a call, then on after it
+        ipc = start + 4 * (uint32_t)(o - b->ops);
+        c.lr = ipc + 4;
+        if (o->imm != ipc + 4) ppc_call_indirect(c, o->imm);
+        pc = ipc + 4;
+        continue;
+    L_BC:
+        ipc = start + 4 * (uint32_t)(o - b->ops);
+        if (bc_taken(c, o->d, o->a)) {
+            target = o->imm;
+            goto jump;
+        }
+        pc = ipc + 4;
+        continue;
+    L_BLR:
+        return;
+
+    jump:
+        if (PPCFunc f = ppc_lookup(target)) {      // a tail call into recompiled code
             f(c);
             return;
         }
-        if (target <= pc) PPC_POLL(c);                // a loop's back-edge
+        if (target <= ipc) PPC_POLL(c);            // a loop's back-edge
         pc = target;
     }
+#undef NEXT
 }
