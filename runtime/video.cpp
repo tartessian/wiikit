@@ -1359,11 +1359,12 @@ void update_pad() {
         if (hidden) SDL_HideCursor(); else SDL_ShowCursor();
     }
     // WIIKIT_PAD="45:A 50.5:@0.2,-0.1 51:A": at each time (seconds from
-    // start) press buttons for 150 ms (A B 1 2 + - H U D L R, X = shake;
+    // start) press buttons for 150 ms (A B 1 2 + - H U D L R, X = shake,
+    // l r the Classic Controller's L and R;
     // "L/10" holds L for 10 s), or move the pointer, which stays:
     // reproducible runs for debugging
     static const char* script = std::getenv("WIIKIT_PAD");
-    uint32_t scripted = 0;
+    uint32_t scripted = 0, scripted_cl = 0;
     static const Clock::time_point t0 = Clock::now();
     static float sx = 0, sy = 0;
     static bool spointer = false;
@@ -1393,6 +1394,8 @@ void update_pad() {
                     const char* n = std::strchr(names, *b);
                     if (n && t >= at && t < at + hold) scripted |= bits[n - names];
                     if (*b == 'X' && t >= at && t < at + hold) p.shake = true;
+                    if ((*b == 'l' || *b == 'r') && t >= at && t < at + hold)   // the Classic's L, R
+                        scripted_cl |= *b == 'l' ? 0x2000u : 0x0200u;
                 }
             }
             while (*q == ' ') ++q;
@@ -1411,6 +1414,7 @@ void update_pad() {
                                                   {0x0008, CL_UP}, {0x0004, CL_DOWN}, {0x0001, CL_LEFT}, {0x0002, CL_RIGHT}};
         for (auto& m : from_remote)
             if (scripted & m[0]) cl |= m[1];
+        cl |= scripted_cl;
         ClassicState& k = c[0];
         k.connected = true;
         k.buttons = cl & 0xFFFF;
