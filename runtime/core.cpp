@@ -3,6 +3,7 @@
 // symbol names and crash reports.
 #include "rt.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -21,22 +22,41 @@ extern const PPCSymbol g_ppc_symbols[];
 uint8_t* g_mem = nullptr;
 thread_local PPCContext* t_ppc = nullptr;
 
+// ppc_set_runtime_native's functions, by address; a change bumps the
+// generation, which empties the lookup caches
+std::mutex g_natives_mx;
+std::unordered_map<uint32_t, PPCFunc> g_natives;
+std::atomic<uint32_t> g_natives_gen{1};
+
+void ppc_set_runtime_native(uint32_t addr, PPCFunc fn) {
+    std::lock_guard<std::mutex> lk(g_natives_mx);
+    if (fn) g_natives[addr] = fn;
+    else g_natives.erase(addr);
+    g_natives_gen.fetch_add(1);
+}
+
 // A binary search of the table, behind a small cache per host thread: code
 // that runs through indirect calls (callbacks, virtual calls, the calls of
 // code written at run time) asks for the same few addresses again and again,
 // the ones with no recompiled function among them
 PPCFunc ppc_lookup(uint32_t addr) {
-    struct Entry { uint32_t addr; bool known; PPCFunc fn; };
+    struct Entry { uint32_t addr; uint32_t gen; PPCFunc fn; };
     static thread_local Entry cache[4096];
     Entry& e = cache[(addr >> 2) & 4095];
-    if (e.known && e.addr == addr) return e.fn;
+    const uint32_t gen = g_natives_gen.load(std::memory_order_relaxed);
+    if (e.gen == gen && e.addr == addr) return e.fn;
     size_t lo = 0, hi = g_ppc_nfuncs;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
         if (g_ppc_funcs[mid].addr < addr) lo = mid + 1; else hi = mid;
     }
     PPCFunc f = lo < g_ppc_nfuncs && g_ppc_funcs[lo].addr == addr ? g_ppc_funcs[lo].fn : nullptr;
-    e = {addr, true, f};
+    if (!f) {
+        std::lock_guard<std::mutex> lk(g_natives_mx);
+        auto it = g_natives.find(addr);
+        if (it != g_natives.end()) f = it->second;
+    }
+    e = {addr, gen, f};
     return f;
 }
 

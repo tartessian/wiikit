@@ -9,6 +9,11 @@
 
 // ---- core.cpp ---------------------------------------------------------------------------
 PPCFunc ppc_lookup(uint32_t addr);
+// A native version of code written at run time (a JIT's helpers, which the
+// interpreter would otherwise run): calls to `addr` run `fn` from now on,
+// until the port withdraws it with nullptr (the code there was rewritten).
+// The port recognizes the code and answers for the equivalence.
+void ppc_set_runtime_native(uint32_t addr, PPCFunc fn);
 // ---- interp.cpp -------------------------------------------------------------------------
 // Run guest code that has no recompiled function (a JIT's, code written at
 // run time) from `addr` until it returns, as a call would.
