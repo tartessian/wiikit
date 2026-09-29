@@ -26,6 +26,7 @@
 // rewritten needs nothing from its writer here, as before.
 #include "rt.h"
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <cstddef>
@@ -559,6 +560,12 @@ struct Op {
 
 struct Block {
     uint32_t start, n;                             // n instructions, their words after the ops
+    // the block's branch to a fixed address (b, bl, bc): what ppc_lookup said
+    // of it, for as long as its generation holds; to_interp: code written at
+    // run time with no native, straight to interp_call
+    uint32_t gen;
+    bool to_interp;
+    PPCFunc fn;
     Op ops[1];                                     // n + 1: a K_END closes them
     const uint8_t* words() const { return reinterpret_cast<const uint8_t*>(ops + n + 1); }
 };
@@ -731,6 +738,15 @@ inline bool same_words(const uint8_t* a, const uint8_t* b, uint32_t n) {
 }
 
 // The block at pc, as memory holds it now
+// What the block's fixed branch target resolves to (see Block::gen)
+inline void resolve(Block* b, uint32_t target) {
+    const uint32_t gen = ppc_lookup_generation();
+    if (b->gen == gen) return;
+    b->fn = ppc_lookup(target);
+    b->to_interp = !b->fn && ppc_runtime_code(target);
+    b->gen = gen;
+}
+
 const Block* block_at(Blocks& bs, const uint8_t* mem, uint32_t pc) {
     Block*& s = bs.slot[(pc >> 2) & (Blocks::kSlots - 1)];
     if (s && s->start == pc && same_words(mem + pc, s->words(), s->n)) return s;
@@ -747,6 +763,9 @@ const Block* block_at(Blocks& bs, const uint8_t* mem, uint32_t pc) {
     Block* b = static_cast<Block*>(bs.alloc(offsetof(Block, ops) + sizeof(Op) * (n + 1) + 4 * n));
     b->start = pc;
     b->n = n;
+    b->gen = 0;                                    // (generations start at 1)
+    b->to_interp = false;
+    b->fn = nullptr;
     std::memcpy(b->ops, ops, sizeof(Op) * (n + 1));
     std::memcpy(const_cast<uint8_t*>(b->words()), mem + pc, 4 * n);
     s = b;
@@ -882,24 +901,45 @@ void interp_call(PPCContext& c, uint32_t pc) {
     L_B:
         ipc = start + 4 * (uint32_t)(o - b->ops);
         target = o->imm;
-        goto jump;
+        goto jump_fixed;
     L_BL:                                          // a call, then on after it
         ipc = start + 4 * (uint32_t)(o - b->ops);
         c.lr = ipc + 4;
-        if (o->imm != ipc + 4) ppc_call_indirect(c, o->imm);
+        if (o->imm != ipc + 4) {
+            // as ppc_call_indirect, with its lookup kept in the block
+            // (WIIKIT_ICALLS, which counts the calls, still goes through it)
+            static const bool counting = std::getenv("WIIKIT_ICALLS") != nullptr;
+            Block* mb = const_cast<Block*>(b);
+            resolve(mb, o->imm);
+            if (counting) ppc_call_indirect(c, o->imm);
+            else if (mb->fn) mb->fn(c);
+            else if (mb->to_interp) interp_call(c, o->imm);
+            else ppc_call_indirect(c, o->imm);
+        }
         pc = ipc + 4;
         continue;
     L_BC:
         ipc = start + 4 * (uint32_t)(o - b->ops);
         if (bc_taken(c, o->d, o->a)) {
             target = o->imm;
-            goto jump;
+            goto jump_fixed;
         }
         pc = ipc + 4;
         continue;
     L_BLR:
         return;
 
+    jump_fixed: {                                  // jump, with the lookup kept in the block
+        Block* mb = const_cast<Block*>(b);
+        resolve(mb, target);
+        if (mb->fn) {
+            mb->fn(c);
+            return;
+        }
+        if (target <= ipc) PPC_POLL(c);
+        pc = target;
+        continue;
+    }
     jump:
         if (PPCFunc f = ppc_lookup(target)) {      // a tail call into recompiled code
             f(c);

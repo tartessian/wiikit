@@ -14,6 +14,11 @@ PPCFunc ppc_lookup(uint32_t addr);
 // until the port withdraws it with nullptr (the code there was rewritten).
 // The port recognizes the code and answers for the equivalence.
 void ppc_set_runtime_native(uint32_t addr, PPCFunc fn);
+// For callers that keep ppc_lookup's answers: it changes only when the
+// generation does. And whether addr is code written at run time (RAM past
+// the executable's code), which ppc_call_indirect sends to the interpreter.
+uint32_t ppc_lookup_generation();
+bool ppc_runtime_code(uint32_t addr);
 // ---- interp.cpp -------------------------------------------------------------------------
 // Run guest code that has no recompiled function (a JIT's, code written at
 // run time) from `addr` until it returns, as a call would.

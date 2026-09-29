@@ -99,6 +99,13 @@ static bool in_ram(uint32_t addr) {
            ((addr >= 0x80000000u && addr < 0x81800000u) || (addr >= 0x90000000u && addr < 0x94000000u));
 }
 
+uint32_t ppc_lookup_generation() { return g_natives_gen.load(std::memory_order_relaxed); }
+
+bool ppc_runtime_code(uint32_t addr) {
+    return in_ram(addr) && g_ppc_nfuncs &&
+           !(addr >= g_ppc_funcs[0].addr && addr <= g_ppc_funcs[g_ppc_nfuncs - 1].addr);
+}
+
 static void report_gap(uint32_t addr) {
     static std::mutex mx;
     static std::unordered_map<uint32_t, bool> told;
