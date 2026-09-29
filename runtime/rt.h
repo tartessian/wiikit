@@ -77,6 +77,13 @@ void gx_report();                                 // command stream statistics
 using GxTextureFilter = bool (*)(uint32_t fmt, int w, int h, uint64_t hash, const uint8_t* rgba,
                                  std::vector<uint8_t>& out, int& out_w, int& out_h);
 void gx_set_texture_filter(GxTextureFilter f);
+// Draw done (GXDrawDone, GXSetDrawDone) as soon as the game records it,
+// not once the renderer draws it: the game goes on to its next frame while
+// the renderer draws this one. For a port whose game does not need what the
+// GP drew before going on (the runtime already reads textures, vertices and
+// palettes when the game records them); a picture is still shown only once
+// its copy is drawn. Not with vertical sync, whose pace comes from that wait.
+void gx_set_early_draw_done(bool on);
 void gx_trace_next_frame();                       // the next frame's commands to gxtrace_N.txt (F12)
 void gx_submit_pending();                         // after a burst, outside g_hw: hand the record to the renderer
 void gx_draw_done_reached();                      // the renderer: the game's draw-done point is drawn

@@ -189,6 +189,7 @@ uint32_t used_maps() {
 }
 
 GxTextureFilter tex_filter = nullptr;
+bool early_draw_done = false;                      // gx_set_early_draw_done
 
 void bind_map(int m) {
     int off = (m & 3) + (m >= 4 ? 0x20 : 0);
@@ -554,7 +555,11 @@ void bp_write(uint32_t v) {
         // when the renderer gets there, as the GP would: the game waits
         // for it asleep (GXWaitDrawDone), and its other threads (the
         // disc, the sound stream) run meanwhile
-        if (video) { put<uint8_t>(VC_DRAWDONE); flush(true); return; }
+        // (or at once, gx_set_early_draw_done, but not with vertical sync:
+        // the wait for the renderer, held at the display's refresh, is then
+        // what keeps the game at the display's pace, a picture a refresh)
+        if (video && !(early_draw_done && !video_vsync())) { put<uint8_t>(VC_DRAWDONE); flush(true); return; }
+        if (video) flush(true);
         pe_ctrl |= 8; ++st.done; os_raise();
         return;
     case 0x47: pe_token = (uint16_t)val; return;                      // token
@@ -828,3 +833,4 @@ void gx_report() {
 }
 
 void gx_set_texture_filter(GxTextureFilter f) { tex_filter = f; }
+void gx_set_early_draw_done(bool on) { early_draw_done = on; }
