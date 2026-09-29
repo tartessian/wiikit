@@ -64,4 +64,5 @@ KPADDisableDPD
 KPADGetSensorHeight
 KPADIsEnableAimingMode
 __VIRetraceHandler     # VI's interrupt: the Remotes' connect and extension callbacks are called after it
+VIWaitForRetrace       # a frame's end: the frame limiter gives the retrace when the frame's time is up
 kpad_wpad_status       # (chan, buf, dev) -> buf: the 2007 KPAD's copy of its WPAD samples of one device; no symbol names it, ports give it this name

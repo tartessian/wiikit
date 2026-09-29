@@ -88,7 +88,7 @@ bool mem_ok(uint32_t a, size_t n) {
 
 // ---- the record ------------------------------------------------------------------------------
 bool video = false;
-std::vector<uint8_t> rec;
+Record rec;
 int rec_frames = 0;
 
 uint8_t* grow(size_t n) {

@@ -22,7 +22,9 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct GVtx {
@@ -41,8 +43,19 @@ enum : uint8_t { VTX_COL0 = 1, VTX_COL1 = 2, VTX_NRM = 4, VTX_NBT = 8 };
 bool video_enabled();                       // false with --no-video: the stream is parsed only
 // Takes the record and leaves it empty; waits while the renderer has
 // frames_ahead frames queued, at most wait_ms (-1: as long as it takes).
+
+// A record's bytes: a vector whose growth leaves new bytes uninitialised, as
+// every byte is written at once (zero-filling them cost more than the writes)
+template <class T> struct NoInitAllocator : std::allocator<T> {
+    template <class U> struct rebind { using other = NoInitAllocator<U>; };
+    using std::allocator<T>::allocator;
+    template <class U> void construct(U* p) noexcept { ::new ((void*)p) U; }
+    template <class U, class... A> void construct(U* p, A&&... a) { ::new ((void*)p) U(std::forward<A>(a)...); }
+};
+using Record = std::vector<uint8_t, NoInitAllocator<uint8_t>>;
+
 // False if the time ran out: the record is left as it was.
-bool video_submit(std::vector<uint8_t>& rec, int frames, int wait_ms = -1);
+bool video_submit(Record& rec, int frames, int wait_ms = -1);
 void video_set_xfb(uint32_t top_field_addr); // VI: the XFB being scanned out (physical)
 void video_retrace();                        // VI: a vertical retrace happened
 void video_set_lines(uint32_t lines);        // VI: lines of picture scanned out (of 480 for NTSC)
@@ -151,3 +164,10 @@ void video_on_ambient_occlusion(void (*on_change)(int level));
 void video_set_widescreen(bool on);
 bool video_widescreen();
 void video_on_widescreen(void (*on_change)(bool on));
+
+// Vertical sync: presents wait for the display's refresh (no tearing); with a
+// frame rate above the display's, the game follows the display (the record
+// queue fills and it waits). Any thread may ask. `on_change` hears changes.
+void video_set_vsync(bool on);
+bool video_vsync();
+void video_on_vsync(void (*on_change)(bool on));

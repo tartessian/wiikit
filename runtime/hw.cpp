@@ -960,6 +960,16 @@ void hw_run_locked(void (*fn)()) {
     fn();
 }
 
+// The frame rate a port may ask for in place of VI's own (hw_set_frame_rate):
+// the retraces the game waits for come at that rate
+std::atomic<int64_t> frame_period_ns{0};                // 0: VI's own
+
+void hw_set_frame_rate(double hz) {
+    frame_period_ns = hz > 0 ? (int64_t)(1e9 / hz) : hz < 0 ? 1 : 0;   // unlimited: no wait at all
+}
+
+std::chrono::nanoseconds hw_frame_period() { return std::chrono::nanoseconds(frame_period_ns.load()); }
+
 std::chrono::nanoseconds hw_vi_field_period() {
     std::lock_guard<std::recursive_mutex> lk(g_hw);
     ViTiming t = vi_timing();
@@ -971,6 +981,7 @@ uint8_t aram_read(uint32_t addr) {
 }
 
 void hw_init() {
+    if (const char* fps = std::getenv("WIIKIT_FPS")) hw_set_frame_rate(std::atof(fps));   // debugging
     sram_init();
     if (g_gamecube) aram.assign(0x01000000, 0);
     vi_frame_tb = os_tb_now();

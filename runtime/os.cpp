@@ -319,20 +319,57 @@ void idle_wait() {
 
 // The clock keeps host time: the guest may rewrite the time base (mttb), so
 // only the decrementer's distance is measured in guest ticks.
+// The frame limiter (hw_set_frame_rate): a game waits for the retrace at the
+// end of each frame (VIWaitForRetrace). With a frame rate of its own the
+// retrace comes once the game waits for it and the frame's time is up: never
+// sooner than the period after the last, and a frame that took longer is not
+// held for a whole period more, as a fixed retrace would do (a frame of 4.5 ms
+// at 240 fps shown for 8.3). Unlimited: as soon as it waits. While the game
+// waits for nothing (a load) the retrace still comes every 50 ms, as VI's
+// interrupt drives more than the frames.
+std::atomic<int> g_vi_waiters{0};
+PPCFunc orig_VIWaitForRetrace;
+
+void hle_VIWaitForRetrace(PPCContext& c) {
+    ++g_vi_waiters;
+    clock_kick();
+    orig_VIWaitForRetrace(c);
+    --g_vi_waiters;
+}
+
 void clock_main() {
     // retraces at the rate VI is programmed for: 59.94 Hz NTSC and EuRGB60,
-    // 50 Hz PAL
+    // 50 Hz PAL; or the frame limiter's
     auto vi_period = hw_vi_field_period();
     auto next_vi = Clock::now() + vi_period;
+    auto last_vi = Clock::now();
+    constexpr auto kLoadRetrace = std::chrono::milliseconds(50);
     for (;;) {
         auto now = Clock::now();
-        if (now >= next_vi) {
-            hw_vi_retrace();
-            vi_period = hw_vi_field_period();
-            next_vi += vi_period;
-            if (next_vi <= now) next_vi = now + vi_period;
+        const auto frame = hw_frame_period();
+        Clock::time_point next_event;
+        if (frame.count() && orig_VIWaitForRetrace) {
+            const bool waiting = g_vi_waiters.load() > 0;
+            if ((now >= next_vi && waiting) || now - last_vi >= kLoadRetrace) {
+                hw_vi_retrace();
+                // on time: the next deadline a period on, keeping the rate; late
+                // (by more than a little): a period from now, not a hurried frame
+                next_vi += frame;
+                if (next_vi < now + frame - std::chrono::microseconds(500)) next_vi = now + frame;
+                last_vi = now;
+            }
+            next_event = waiting ? next_vi : last_vi + kLoadRetrace;   // a wait kicks the clock
+        } else {
+            if (now >= next_vi) {
+                hw_vi_retrace();
+                vi_period = hw_vi_field_period();
+                next_vi += vi_period;
+                if (next_vi <= now) next_vi = now + vi_period;
+                last_vi = now;
+            }
+            next_event = next_vi;
         }
-        auto wake = std::min(next_vi, hw_tick());
+        auto wake = std::min(next_event, hw_tick());
         {
             std::lock_guard<std::mutex> lk(g_clock_mx);
             if (g_dec_armed) {
@@ -484,6 +521,7 @@ void os_install() {
     for (const char* n : {"OSReturnToMenu", "OSRestart", "OSShutdownSystem", "__OSReboot"})
         ppc_hook(n, hle_leave);
     ppc_hook("RealMode", [](PPCContext&) {});  // BAT set-up: the address space is flat already
+    orig_VIWaitForRetrace = ppc_hook("VIWaitForRetrace", hle_VIWaitForRetrace);   // the frame limiter
     std::thread(clock_main).detach();
 }
 

@@ -45,11 +45,11 @@ constexpr int EFB_W = 640, EFB_H = 528;
 using Clock = std::chrono::steady_clock;
 
 // ---- the queue from the game ------------------------------------------------------------------
-struct Chunk { std::vector<uint8_t> data; int frames; };
+struct Chunk { Record data; int frames; };
 std::mutex qmx;
 std::condition_variable q_space;
 std::deque<Chunk> q;
-std::vector<std::vector<uint8_t>> spare;           // record buffers to reuse (under qmx)
+std::vector<Record> spare;           // record buffers to reuse (under qmx)
 int q_frames = 0;
 SDL_Semaphore* wake = nullptr;
 std::atomic<uint32_t> xfb_addr{0}, retraces{0}, vi_lines{480};
@@ -804,7 +804,7 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
 // ---- the record -----------------------------------------------------------------------------------
 template <class T> T rd(const uint8_t*& p) { T v; std::memcpy(&v, p, sizeof v); p += sizeof v; return v; }
 
-void exec(const std::vector<uint8_t>& data) {
+void exec(const Record& data) {
     const uint8_t* p = data.data();
     const uint8_t* end = p + data.size();
     while (p < end) {
@@ -909,6 +909,11 @@ void write_png(const std::string& path, int w, int h, const uint8_t* rgba) {
 }
 
 namespace {
+
+// vertical sync (video_set_vsync): the window's thread sets the swap interval
+std::atomic<bool> vsync{false};
+std::atomic<int> vsync_request{-1};
+std::vector<void (*)(bool)> vsync_listeners;
 
 // the TV's shape (video_set_widescreen): SYSCONF's at the start, then as asked;
 // the picture's place in the window follows it at the next present
@@ -1414,8 +1419,18 @@ void update_pad() {
     for (int i = 0; i < 4; ++i) classic[i] = c[i];
 }
 
+// the intervals between presents, for WIIKIT_PERF's frame times
+std::vector<float> present_ms;
+Clock::time_point present_prev;
+
 void present() {
     ++cnt.presents;
+    if (g_vperf_on) {
+        const auto now = Clock::now();
+        if (present_prev.time_since_epoch().count())
+            present_ms.push_back(std::chrono::duration<float, std::milli>(now - present_prev).count());
+        present_prev = now;
+    }
     int ww = 0, wh = 0;
     SDL_GetWindowSizeInPixels(win, &ww, &wh);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1536,12 +1551,17 @@ void setup() {
 
 // ---- the game's side ------------------------------------------------------------------------------
 bool video_enabled() { return opt.enabled; }
-void video_configure(const VideoOptions& o) { opt = o; S = std::max(1, o.scale); widescreen = o.widescreen; }
+void video_configure(const VideoOptions& o) {
+    opt = o;
+    S = std::max(1, o.scale);
+    widescreen = o.widescreen;
+    if (std::getenv("WIIKIT_VSYNC")) vsync = true;                   // debugging
+}
 
 VideoPerf g_vperf;
 bool g_vperf_on = std::getenv("WIIKIT_PERF") != nullptr;
 
-bool video_submit(std::vector<uint8_t>& rec, int frames, int wait_ms) {
+bool video_submit(Record& rec, int frames, int wait_ms) {
     auto t0 = Clock::now();
     std::unique_lock<std::mutex> lk(qmx);
     // frames in flight: each one queued is 33 ms more between what the game
@@ -1561,7 +1581,7 @@ bool video_submit(std::vector<uint8_t>& rec, int frames, int wait_ms) {
         rec = std::move(spare.back());
         spare.pop_back();
     } else {
-        rec = std::vector<uint8_t>();
+        rec = Record();
         rec.reserve(2u << 20);
     }
     lk.unlock();
@@ -1620,9 +1640,11 @@ void video_run(const char* title) {
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
     SDL_GL_MakeCurrent(win, ctx);
-    SDL_GL_SetSwapInterval(0);                   // VI paces the presents
+    SDL_GL_SetSwapInterval(vsync ? 1 : 0);       // VI (or the frame limiter) paces the presents; vsync on request
     if (!gl_load()) rt_die("video: OpenGL functions missing");
     rt_log("video: %s, %s", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
+    if (const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win)))
+        rt_log("video: display %dx%d at %.2f Hz", dm->w, dm->h, dm->refresh_rate);
     if (debug) {
         glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
         glDebugMessageCallback(gl_debug, nullptr);
@@ -1637,9 +1659,12 @@ void video_run(const char* title) {
     auto t0 = Clock::now(), t_title = t0;
     uint64_t frames_then = 0;
     uint32_t seen = retraces.load();
+    uint64_t frames_shown = 0;
+    auto last_present = t0;
     std::string base_title = title;
     for (;;) {
         if (int r = display_request.exchange(-1); r >= 0 && r != display_mode) apply_display_mode(r);
+        if (int v = vsync_request.exchange(-1); v >= 0) SDL_GL_SetSwapInterval(v);
         if (int r = scale_request.exchange(-1); r >= 0) apply_scale(r);
         SDL_Event e;
         bool quit = false;
@@ -1714,6 +1739,17 @@ void video_run(const char* title) {
                 rt_log("perf: %.1f fps; frame %.1f ms; game thread: vertices %.1f, textures %.1f, waiting for the renderer %.1f; "
                        "renderer %.1f, presenting %.1f ms", f / s, 1000.0 * s / f, vtx, tex, wait, draw, pres);
             }
+            if (g_vperf_on && present_ms.size() > 1) {                      // the frame times the window showed
+                std::vector<float> v = present_ms;
+                std::sort(v.begin(), v.end());
+                double sum = 0, sq = 0;
+                for (float x : v) { sum += x; sq += (double)x * x; }
+                const double mean = sum / (double)v.size();
+                rt_log("perf: frame times %.2f ms mean, %.2f ms sd, %.2f ms p99, %.2f ms max (%zu presents)", mean,
+                       std::sqrt(std::max(0.0, sq / (double)v.size() - mean * mean)),
+                       v[std::min(v.size() - 1, v.size() * 99 / 100)], v.back(), v.size());
+                present_ms.clear();
+            }
             frames_then = cnt.frames;
             t_title = now;
         }
@@ -1739,12 +1775,19 @@ void video_run(const char* title) {
             busy = true;
             if (retraces.load() != seen) break;
         }
+        // a present at a retrace with a new picture (the frame limiter's rates
+        // would otherwise show one picture many times), and every 100 ms
+        // anyway, so that the window keeps up while the game shows nothing new
         uint32_t r = retraces.load();
         if (r != seen) {
             seen = r;
             auto tp = Clock::now();
-            present();
-            if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
+            if (cnt.frames != frames_shown || tp - last_present >= std::chrono::milliseconds(100)) {
+                frames_shown = cnt.frames;
+                last_present = tp;
+                present();
+                if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
+            }
             busy = true;
         }
         if (!busy) SDL_WaitSemaphoreTimeout(wake, 5);
@@ -1790,3 +1833,10 @@ void video_set_widescreen(bool on) {
 }
 bool video_widescreen() { return widescreen.load(); }
 void video_on_widescreen(void (*on_change)(bool on)) { widescreen_listeners.push_back(on_change); }
+void video_set_vsync(bool on) {
+    vsync = on;
+    vsync_request = on ? 1 : 0;
+    for (auto f : vsync_listeners) f(on);
+}
+bool video_vsync() { return vsync.load(); }
+void video_on_vsync(void (*on_change)(bool on)) { vsync_listeners.push_back(on_change); }

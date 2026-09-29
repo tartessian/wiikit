@@ -84,6 +84,12 @@ bool hw_load_fonts(const char* dir);               // font_japanese.bin, font_we
 bool hw_external_pending();                        // PI cause & mask
 void hw_vi_retrace();                              // called at each vertical retrace
 std::chrono::nanoseconds hw_vi_field_period();     // from the timing VI is programmed with
+// A frame rate in place of VI's own (os.cpp's frame limiter): hz > 0 at most
+// that many frames a second, hz < 0 as many as the game makes, 0 VI's own
+// retraces again. hw_frame_period is 0 for VI's own, else the period (1 ns
+// unlimited).
+void hw_set_frame_rate(double hz);
+std::chrono::nanoseconds hw_frame_period();
 std::chrono::steady_clock::time_point hw_tick();   // timed device events; returns the next one
 extern bool g_mmio_log;                            // log every first access to a register
 
