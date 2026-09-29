@@ -53,6 +53,7 @@ std::vector<Record> spare;           // record buffers to reuse (under qmx)
 int q_frames = 0;
 SDL_Semaphore* wake = nullptr;
 std::atomic<uint32_t> xfb_addr{0}, retraces{0}, vi_lines{480};
+std::atomic<bool> xfb_flipping{false};                // the game alternates XFBs (VI's TFBL changes)
 std::mutex pad_mx;
 PadState pad;
 ClassicState classic[4];
@@ -105,6 +106,9 @@ std::unordered_map<uint32_t, Tex> efb_copies;      // EFB copies to texture, by 
 std::unordered_map<uint32_t, Tex> xfbs;            // EFB copies to the XFB, by address
 uint64_t map_src[8];                               // per map: texture id, or 1 << 32 | EFB copy address
 uint32_t last_xfb = 0;
+// each copy to the XFB, numbered: the latest one's number, by address
+std::unordered_map<uint32_t, uint64_t> xfb_gens;
+uint64_t xfb_gen = 0;
 std::unordered_map<std::string, GLuint> programs;
 
 struct Counters { uint64_t frames, presents, draws, programs; } cnt;
@@ -481,6 +485,7 @@ void efb_copy(uint32_t v) {
         glBlitNamedFramebuffer(efb_fbo, copy_fbo, x * S, y * S, (x + w) * S, (y + h) * S, 0, 0, w * S, h * S,
                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
         last_xfb = dest;
+        xfb_gens[dest] = ++xfb_gen;
         ++cnt.frames;
     } else {                                                     // to a texture
         bool half = v >> 9 & 1;
@@ -1431,7 +1436,7 @@ void update_pad() {
 std::vector<float> present_ms;
 Clock::time_point present_prev;
 
-void present() {
+void present(uint32_t addr) {
     ++cnt.presents;
     if (g_vperf_on) {
         const auto now = Clock::now();
@@ -1446,7 +1451,7 @@ void present() {
     glColorMask(1, 1, 1, 1);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    auto it = xfbs.find(xfb_addr.load());
+    auto it = xfbs.find(addr);
     if (it == xfbs.end()) it = xfbs.find(last_xfb);
     if (it != xfbs.end() && ww > 0 && wh > 0) {
         const Tex& t = it->second;
@@ -1617,7 +1622,12 @@ bool video_submit(Record& rec, int frames, int wait_ms) {
     return true;
 }
 
-void video_set_xfb(uint32_t a) { xfb_addr.store(a); }
+void video_set_xfb(uint32_t a) {
+    const uint32_t was = xfb_addr.exchange(a);
+    if (was == a) return;
+    if (was) xfb_flipping = true;
+    if (wake) SDL_SignalSemaphore(wake);
+}
 void video_set_lines(uint32_t n) { vi_lines.store(n); }
 std::atomic<bool> want_relative{false};
 std::mutex motion_mx;
@@ -1687,7 +1697,8 @@ void video_run(const char* title) {
     auto t0 = Clock::now(), t_title = t0;
     uint64_t frames_then = 0;
     uint32_t seen = retraces.load();
-    uint64_t frames_shown = 0;
+    uint64_t frames_shown = 0, gen_shown = 0;
+    uint32_t xfb_shown = 0;
     auto last_present = t0;
     std::string base_title = title;
     for (;;) {
@@ -1801,19 +1812,32 @@ void video_run(const char* title) {
             }
             q_space.notify_all();
             busy = true;
-            if (retraces.load() != seen) break;
+            if (retraces.load() != seen || xfb_addr.load() != xfb_shown) break;
         }
         // a present at a retrace with a new picture (the frame limiter's rates
         // would otherwise show one picture many times), and every 100 ms
         // anyway, so that the window keeps up while the game shows nothing new
+        //
+        // A game that alternates XFBs shows a new one by pointing VI at it,
+        // from its retrace handler, which runs after the retrace: its picture
+        // is presented then, once its copy has run (a newer copy than the one
+        // shown), not at the retrace, which would show the previous XFB again
+        // and skip one later
         uint32_t r = retraces.load();
-        if (r != seen) {
+        const uint32_t a = xfb_addr.load();
+        const auto g = xfb_gens.find(a);
+        const bool flip = xfb_flipping && g != xfb_gens.end() && g->second > gen_shown;
+        if (r != seen || flip) {
+            const bool retrace = r != seen;
             seen = r;
             auto tp = Clock::now();
-            if (cnt.frames != frames_shown || tp - last_present >= std::chrono::milliseconds(100)) {
+            if (flip || (retrace && ((!xfb_flipping && cnt.frames != frames_shown) ||
+                                     tp - last_present >= std::chrono::milliseconds(100)))) {
                 frames_shown = cnt.frames;
+                if (g != xfb_gens.end()) gen_shown = std::max(gen_shown, g->second);
+                xfb_shown = a;
                 last_present = tp;
-                present();
+                present(a);
                 if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
             }
             busy = true;
