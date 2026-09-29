@@ -1354,8 +1354,9 @@ void update_pad() {
         if (hidden) SDL_HideCursor(); else SDL_ShowCursor();
     }
     // WIIKIT_PAD="45:A 50.5:@0.2,-0.1 51:A": at each time (seconds from
-    // start) press buttons for 150 ms (A B 1 2 + - H U D L R, X = shake), or
-    // move the pointer, which stays: reproducible runs for debugging
+    // start) press buttons for 150 ms (A B 1 2 + - H U D L R, X = shake;
+    // "L/10" holds L for 10 s), or move the pointer, which stays:
+    // reproducible runs for debugging
     static const char* script = std::getenv("WIIKIT_PAD");
     uint32_t scripted = 0;
     static const Clock::time_point t0 = Clock::now();
@@ -1373,13 +1374,20 @@ void update_pad() {
                 if (t >= at) { sx = x; sy = y; spointer = true; }
                 q = e;
             } else {
-                for (; *q && *q != ' '; ++q) {
+                const char* b = q;
+                while (*q && *q != ' ' && *q != '/') ++q;
+                double hold = 0.15;
+                if (*q == '/') {
+                    hold = std::strtod(q + 1, &e);
+                    q = e;
+                }
+                for (; b < q && *b != '/'; ++b) {
                     static const char names[] = "AB12+-HUDLR";
                     static const uint32_t bits[] = {0x0800, 0x0400, 0x0200, 0x0100, 0x0010, 0x1000,
                                                     0x8000, 0x0008, 0x0004, 0x0001, 0x0002};
-                    const char* n = std::strchr(names, *q);
-                    if (n && t >= at && t < at + 0.15) scripted |= bits[n - names];
-                    if (*q == 'X' && t >= at && t < at + 0.15) p.shake = true;
+                    const char* n = std::strchr(names, *b);
+                    if (n && t >= at && t < at + hold) scripted |= bits[n - names];
+                    if (*b == 'X' && t >= at && t < at + hold) p.shake = true;
                 }
             }
             while (*q == ' ') ++q;
@@ -1457,6 +1465,26 @@ void present() {
         char name[64];
         std::snprintf(name, sizeof name, "/frame_%06llu.png", (unsigned long long)cnt.presents);
         write_png(std::string(opt.dump_dir) + name, ww, wh, flip.data());
+    }
+    // WIIKIT_MOTIONLOG=file: for each present its time and a band of the
+    // picture in gray (the middle third of the rows), to measure how evenly
+    // the image moves (camera judder) without slowing the presents much.
+    // Each record: the time in seconds (double), the band's width and height
+    // (two int32), its pixels, bottom row first
+    static FILE* motion = std::getenv("WIIKIT_MOTIONLOG") ? std::fopen(std::getenv("WIIKIT_MOTIONLOG"), "wb") : nullptr;
+    if (motion && ww > 0 && wh > 0) {
+        const int bh = wh / 3;
+        static std::vector<uint8_t> px, gray;
+        px.resize((size_t)ww * bh * 4);
+        gray.resize((size_t)ww * bh);
+        glReadPixels(0, wh / 3, ww, bh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        for (size_t i = 0; i < gray.size(); ++i)
+            gray[i] = (uint8_t)((px[i * 4] * 77 + px[i * 4 + 1] * 150 + px[i * 4 + 2] * 29) >> 8);
+        const double t = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+        const int32_t dims[2] = {ww, bh};
+        std::fwrite(&t, sizeof t, 1, motion);
+        std::fwrite(dims, sizeof dims, 1, motion);
+        std::fwrite(gray.data(), 1, gray.size(), motion);
     }
     SDL_GL_SwapWindow(win);
 }
