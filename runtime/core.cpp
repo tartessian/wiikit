@@ -21,13 +21,23 @@ extern const PPCSymbol g_ppc_symbols[];
 uint8_t* g_mem = nullptr;
 thread_local PPCContext* t_ppc = nullptr;
 
+// A binary search of the table, behind a small cache per host thread: code
+// that runs through indirect calls (callbacks, virtual calls, the calls of
+// code written at run time) asks for the same few addresses again and again,
+// the ones with no recompiled function among them
 PPCFunc ppc_lookup(uint32_t addr) {
+    struct Entry { uint32_t addr; bool known; PPCFunc fn; };
+    static thread_local Entry cache[4096];
+    Entry& e = cache[(addr >> 2) & 4095];
+    if (e.known && e.addr == addr) return e.fn;
     size_t lo = 0, hi = g_ppc_nfuncs;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
         if (g_ppc_funcs[mid].addr < addr) lo = mid + 1; else hi = mid;
     }
-    return lo < g_ppc_nfuncs && g_ppc_funcs[lo].addr == addr ? g_ppc_funcs[lo].fn : nullptr;
+    PPCFunc f = lo < g_ppc_nfuncs && g_ppc_funcs[lo].addr == addr ? g_ppc_funcs[lo].fn : nullptr;
+    e = {addr, true, f};
+    return f;
 }
 
 // WIIKIT_ICALLS=1: indirect calls (bctrl, blrl: virtual calls, callbacks, a
