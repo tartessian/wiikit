@@ -352,10 +352,11 @@ void clock_main() {
             const bool waiting = g_vi_waiters.load() > 0;
             if ((now >= next_vi && waiting) || now - last_vi >= kLoadRetrace) {
                 hw_vi_retrace();
-                // on time: the next deadline a period on, keeping the rate; late
-                // (by more than a little): a period from now, not a hurried frame
+                // the next deadline a period on, keeping the rate: a frame that
+                // ran a little late is made up by the next ones if they can; late
+                // by more than a period (a load, a stall), a period from now
                 next_vi += frame;
-                if (next_vi < now + frame - std::chrono::microseconds(500)) next_vi = now + frame;
+                if (next_vi < now) next_vi = now + frame;
                 last_vi = now;
             }
             next_event = waiting ? next_vi : last_vi + kLoadRetrace;   // a wait kicks the clock
