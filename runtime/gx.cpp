@@ -124,6 +124,27 @@ uint64_t hash_mem(const uint8_t* p, size_t n) {
     return h;
 }
 
+// A hash only to see whether memory changed, about four times faster than
+// hash_mem (four independent lanes instead of one chain); hash_mem stays
+// the texture's identity for a port's filter
+uint64_t hash_changes(const uint8_t* p, size_t n) {
+    const uint64_t k = 0xFF51AFD7ED558CCDull;
+    uint64_t a = 0x9E3779B97F4A7C15ull ^ n, b = 0xC2B2AE3D27D4EB4Full, c = 0x165667B19E3779F9ull,
+             d = 0x27D4EB2F165667C5ull;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        std::memcpy(w, p + i, 32);
+        a = (a ^ w[0]) * k; a ^= a >> 29;
+        b = (b ^ w[1]) * k; b ^= b >> 29;
+        c = (c ^ w[2]) * k; c ^= c >> 29;
+        d = (d ^ w[3]) * k; d ^= d >> 29;
+    }
+    uint64_t h = a ^ (b << 17 | b >> 47) ^ (c << 31 | c >> 33) ^ (d << 47 | d >> 17);
+    for (; i < n; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
 // ---- textures --------------------------------------------------------------------------------
 // Decoded textures are cached by what names them (address, format, size,
 // levels, palette) and re-uploaded when their bytes change. Bytes are hashed
@@ -141,7 +162,7 @@ struct TexKeyHash {
         return (size_t)(k.addr * 0x9E3779B1u ^ k.shape * 0x85EBCA77u ^ k.levels ^ k.tlut);
     }
 };
-struct TexEntry { uint32_t id; uint64_t hash; uint32_t gen; };
+struct TexEntry { uint32_t id; uint64_t hash; uint32_t gen; };   // hash: hash_changes of the bytes
 std::unordered_map<TexKey, TexEntry, TexKeyHash> tcache;
 uint32_t tex_next_id = 1, tex_gen = 1;
 uint8_t tex_dirty = 0xFF;                          // maps whose binding must be looked at again
@@ -179,7 +200,7 @@ void bind_map(int m) {
 
     auto c = copies.find(addr);
     if (c != copies.end() && mem_ok(addr, c->second.size) &&
-        hash_mem(host(virt(addr)), c->second.size) == c->second.hash) {
+        hash_changes(host(virt(addr)), c->second.size) == c->second.hash) {
         uint64_t tag = 1ull << 32 | addr;
         if (map_bound[m] != tag) {
             put<uint8_t>(VC_TEXEFB);
@@ -220,7 +241,7 @@ void bind_map(int m) {
     TexEntry& e = it->second;
     bool upload = false;
     if (fresh || e.gen != tex_gen) {
-        uint64_t hh = hash_mem(src, total);
+        uint64_t hh = hash_changes(src, total);
         upload = fresh || hh != e.hash;
         e.hash = hh;
         e.gen = tex_gen;
@@ -241,7 +262,8 @@ void bind_map(int m) {
         }
         int ow = w, oh = h, olevels = levels;
         const std::vector<uint8_t>* out = &decoded;
-        if (tex_filter && tex_filter(fmt, w, h, e.hash, decoded.data(), replaced, ow, oh)) {
+        const uint64_t ident = hash_mem(src, total);
+        if (tex_filter && tex_filter(fmt, w, h, ident, decoded.data(), replaced, ow, oh)) {
             out = &replaced;
             olevels = 1;
         }
@@ -259,7 +281,7 @@ void bind_map(int m) {
         if (dump && dumped < 400 && w * h >= 4096) {
             char name[512];
             std::snprintf(name, sizeof name, "%s/tex_%04d_%08X_f%u_%dx%d_%016llX.png", dump, dumped++, addr, fmt, w, h,
-                          (unsigned long long)e.hash);
+                          (unsigned long long)ident);
             write_png(name, ow, oh, out->data());
         }
         map_bound[m] = e.id;
@@ -517,7 +539,7 @@ void efb_copy(uint32_t v) {
     if (v >> 9 & 1) { w = (w + 1) / 2; h = (h + 1) / 2; }
     uint32_t tpf = v >> 3 & 15, real = tpf / 2 + (tpf & 1) * 8;
     size_t size = gxtex_size(copy_tex_fmt(real), w, h);
-    if (mem_ok(dest, size)) copies[dest] = CopyRec{size, hash_mem(host(virt(dest)), size)};
+    if (mem_ok(dest, size)) copies[dest] = CopyRec{size, hash_changes(host(virt(dest)), size)};
     tex_dirty = 0xFF;
 }
 
