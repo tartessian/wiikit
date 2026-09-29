@@ -328,10 +328,12 @@ void idle_wait() {
 // waits for nothing (a load) the retrace still comes every 50 ms, as VI's
 // interrupt drives more than the frames.
 std::atomic<int> g_vi_waiters{0};
+std::atomic<uint64_t> g_vi_waits{0};             // VIWaitForRetrace calls so far
 PPCFunc orig_VIWaitForRetrace;
 
 void hle_VIWaitForRetrace(PPCContext& c) {
     ++g_vi_waiters;
+    ++g_vi_waits;
     clock_kick();
     orig_VIWaitForRetrace(c);
     --g_vi_waiters;
@@ -344,14 +346,20 @@ void clock_main() {
     auto next_vi = Clock::now() + vi_period;
     auto last_vi = Clock::now();
     constexpr auto kLoadRetrace = std::chrono::milliseconds(50);
+    uint64_t served = 0;                          // the waits a retrace has answered
     for (;;) {
         auto now = Clock::now();
         const auto frame = hw_frame_period();
         Clock::time_point next_event;
         if (frame.count() && orig_VIWaitForRetrace) {
-            const bool waiting = g_vi_waiters.load() > 0;
+            // one retrace a wait: the game still counts as waiting until it
+            // wakes, and with a short period (unlimited: 1 ns) the clock would
+            // otherwise fire retraces back to back meanwhile
+            const uint64_t waits = g_vi_waits.load();
+            const bool waiting = g_vi_waiters.load() > 0 && waits != served;
             if ((now >= next_vi && waiting) || now - last_vi >= kLoadRetrace) {
                 hw_vi_retrace();
+                served = waits;
                 // the next deadline a period on, keeping the rate: a frame that
                 // ran a little late is made up by the next ones if they can; late
                 // by more than a period (a load, a stall), a period from now
