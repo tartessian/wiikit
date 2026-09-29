@@ -822,12 +822,14 @@ void ppc_wpar_write(uint32_t) { gathered = 0; }
 
 void ppc_mmio_write(uint32_t a, uint32_t v, int size) {
     if ((a & 0xFFFFF000u) == 0xCC008000u) {
-        for (int i = 0; i < size; ++i) gather[gathered++] = (uint8_t)(v >> (8 * (size - 1 - i)));
+        const uint32_t be = PPC_BSWAP32(v << (8 * (4 - size)));       // its bytes, first first
+        std::memcpy(gather + gathered, &be, 4);                         // (room: gather holds 64)
+        gathered += size;
         if (gathered >= 32) {
-            {
-                std::lock_guard<std::recursive_mutex> lk(g_hw);
-                gx_pipe_burst(gather, 32);
-            }
+            // without g_hw: the stream is the guest's own (one guest thread
+            // runs at a time), and what of GX other host threads also see
+            // (PE's interrupt state) takes it where the parser changes it
+            gx_pipe_burst(gather, 32);
             gathered -= 32;
             std::memmove(gather, gather + 32, (size_t)gathered);
             gx_submit_pending();

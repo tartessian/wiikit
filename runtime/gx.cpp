@@ -560,10 +560,13 @@ void bp_write(uint32_t v) {
         // what keeps the game at the display's pace, a picture a refresh)
         if (video && !(early_draw_done && !video_vsync())) { put<uint8_t>(VC_DRAWDONE); flush(true); return; }
         if (video) flush(true);
-        pe_ctrl |= 8; ++st.done; os_raise();
+        hw_run_locked([] { pe_ctrl |= 8; ++st.done; os_raise(); });   // (the renderer's too: under g_hw)
         return;
     case 0x47: pe_token = (uint16_t)val; return;                      // token
-    case 0x48: pe_token = (uint16_t)val; pe_ctrl |= 4; os_raise(); return;   // token + interrupt
+    case 0x48:                                                        // token + interrupt
+        pe_token = (uint16_t)val;
+        hw_run_locked([] { pe_ctrl |= 4; os_raise(); });
+        return;
     case 0x64: return;                                                // TLUT source address
     case 0x65: {                                                      // load a TLUT into TMEM
         uint32_t src = (bp[0x64] & 0xFFFFFF) << 5, dst = (val & 0x3FF) << 9, n = (val >> 10 & 0x7FF) << 5;
@@ -758,11 +761,16 @@ void gx_submit_pending() {
 // 0x04000000 and points the pipe at a buffer that may lie in MEM2, above it.
 constexpr uint32_t PI_ADDR = 0x1FFFFFFFu, PI_WRAP = 0x20000000u;
 void gx_pipe_burst(const uint8_t* b, int n) {
-    for (int i = 0; i < n; ++i) {
+    // into the FIFO's memory in runs up to its end, where it wraps
+    for (int i = 0; i < n;) {
         uint32_t a = pi_wptr & PI_ADDR;
-        *host(virt(a)) = b[i];
-        ++a;
-        if (pi_end && a == (pi_end & PI_ADDR)) pi_wptr = (pi_base & PI_ADDR) | PI_WRAP;
+        const uint32_t end = pi_end & PI_ADDR;
+        uint32_t k = (uint32_t)(n - i);
+        if (pi_end && end > a && end - a < k) k = end - a;
+        std::memcpy(host(virt(a)), b + i, k);
+        i += (int)k;
+        a += k;
+        if (pi_end && a == end) pi_wptr = (pi_base & PI_ADDR) | PI_WRAP;
         else pi_wptr = (pi_wptr & PI_WRAP) | a;
     }
     if (linked()) feed(b, n);
