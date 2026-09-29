@@ -282,16 +282,6 @@ void sync_textures() {
 int fmt_size(uint32_t fmt) { return fmt == 0 || fmt == 1 ? 1 : fmt == 2 || fmt == 3 ? 2 : 4; }
 int col_size(uint32_t fmt) { static const int s[8] = {2, 3, 4, 2, 3, 4, 4, 4}; return s[fmt & 7]; }
 
-float comp(const uint8_t* q, uint32_t fmt, float sc) {
-    switch (fmt) {
-    case 0: return q[0] * sc;
-    case 1: return (int8_t)q[0] * sc;
-    case 2: return be16(q) * sc;
-    case 3: return (int16_t)be16(q) * sc;
-    default: { uint32_t u = be32(q); float f; std::memcpy(&f, &u, 4); return f; }
-    }
-}
-
 void read_col(const uint8_t* q, uint32_t fmt, uint8_t* o) {
     switch (fmt) {
     case 0: { uint16_t v = be16(q);
@@ -376,46 +366,139 @@ const uint8_t* fetch(uint32_t mode, int arr, int size, const uint8_t*& p, uint32
     return host(virt(cp[0xA0 + arr] + idx * cp[0xB0 + arr] + sub));
 }
 
-uint8_t decode_vertices(const VtxFmt& f, const uint8_t* p, uint32_t count, GVtx* out) {
-    uint32_t pos = f.lo >> 9 & 3, nrm = f.lo >> 11 & 3, col[2] = {f.lo >> 13 & 3, f.lo >> 15 & 3};
-    uint8_t flags = (col[0] ? VTX_COL0 : 0) | (col[1] ? VTX_COL1 : 0) | (nrm ? VTX_NRM : 0) |
-                    (nrm && f.nbt ? VTX_NBT : 0);
-    int nsz = fmt_size(f.nrm_fmt);
-    for (uint32_t k = 0; k < count; ++k) {
-        GVtx& v = out[k];
-        std::memset(&v, 0, sizeof v);
-        for (int i = 0; i < 9; ++i) v.mtx[i] = (f.lo >> i & 1) ? *p++ : f.mtx_default[i];
-        if (pos) {
-            const uint8_t* q = fetch(pos, 0, f.pos_n * fmt_size(f.pos_fmt), p);
-            for (int i = 0; i < f.pos_n; ++i) v.pos[i] = comp(q + i * fmt_size(f.pos_fmt), f.pos_fmt, f.pos_sc);
-        }
-        if (nrm) {
-            float* dst[3] = {v.nrm, v.bin, v.tan};
-            if (f.nbt && f.nidx3 && nrm != 1) {
-                for (int j = 0; j < 3; ++j) {
-                    const uint8_t* q = fetch(nrm, 1, 0, p, (uint32_t)(j * 3 * nsz));
-                    for (int i = 0; i < 3; ++i) dst[j][i] = comp(q + i * nsz, f.nrm_fmt, f.nrm_sc);
-                }
-            } else {
-                int n = f.nbt ? 3 : 1;
-                const uint8_t* q = fetch(nrm, 1, 3 * n * nsz, p);
-                for (int j = 0; j < n; ++j)
-                    for (int i = 0; i < 3; ++i) dst[j][i] = comp(q + (j * 3 + i) * nsz, f.nrm_fmt, f.nrm_sc);
-            }
-        }
-        for (int c = 0; c < 2; ++c) {
-            if (col[c]) read_col(fetch(col[c], 2 + c, col_size(f.col_fmt[c]), p), f.col_fmt[c], v.col[c]);
-            else std::memset(v.col[c], 255, 4);    // a missing colour reads as white
-        }
-        for (int t = 0; t < 8; ++t) {
-            uint32_t m = f.hi >> (2 * t) & 3;
-            if (!m) continue;
-            int cs = fmt_size(f.tc_fmt[t]);
-            const uint8_t* q = fetch(m, 4 + t, f.tc_n[t] * cs, p);
-            for (int i = 0; i < f.tc_n[t]; ++i) v.tc[t][i] = comp(q + i * cs, f.tc_fmt[t], f.tc_sc[t]);
+// A vertex format's decoding, worked out once rather than for each vertex: a
+// template vertex holding what the stream leaves out, then a step per
+// attribute the stream carries, each with a reader for its format and
+// component count
+struct VtxStep {
+    void (*read)(const uint8_t* q, float* dst, float sc);   // floats: n components of one format
+    uint8_t kind;                                             // VS_FLOATS, VS_COLOR, VS_MTX
+    uint8_t mode;                                             // 1 direct, 2 8-bit index, 3 16-bit index
+    uint8_t arr;                                              // CP array, when indexed
+    uint8_t size;                                             // bytes in the stream, when direct
+    uint8_t fmt;                                              // colour format
+    uint16_t dst;                                             // offset in GVtx
+    uint32_t sub;                                             // offset in the array's element
+    float sc;
+};
+enum : uint8_t { VS_FLOATS, VS_COLOR, VS_MTX };
+
+struct VtxPlan {
+    uint32_t key[7];
+    bool valid;
+    int size;                                                 // bytes per vertex
+    uint8_t flags;
+    int nsteps;
+    VtxStep steps[24];
+    GVtx tmpl;
+};
+
+template <int FMT, int N>
+void read_comps(const uint8_t* q, float* d, float sc) {
+    for (int i = 0; i < N; ++i) {
+        if constexpr (FMT == 0) d[i] = q[i] * sc;
+        else if constexpr (FMT == 1) d[i] = (int8_t)q[i] * sc;
+        else if constexpr (FMT == 2) d[i] = be16(q + 2 * i) * sc;
+        else if constexpr (FMT == 3) d[i] = (int16_t)be16(q + 2 * i) * sc;
+        else { uint32_t u = be32(q + 4 * i); std::memcpy(&d[i], &u, 4); }
+    }
+}
+using CompReader = void (*)(const uint8_t*, float*, float);
+template <int FMT, int... N>
+constexpr std::array<CompReader, sizeof...(N)> readers_of(std::integer_sequence<int, N...>) {
+    return {read_comps<FMT, N + 1>...};
+}
+// by format (5 and up read as float) and component count 1..9
+CompReader comp_reader(uint32_t fmt, int n) {
+    static constexpr std::array<CompReader, 9> r[5] = {
+        readers_of<0>(std::make_integer_sequence<int, 9>{}), readers_of<1>(std::make_integer_sequence<int, 9>{}),
+        readers_of<2>(std::make_integer_sequence<int, 9>{}), readers_of<3>(std::make_integer_sequence<int, 9>{}),
+        readers_of<4>(std::make_integer_sequence<int, 9>{})};
+    return r[fmt < 4 ? fmt : 4][n - 1];
+}
+
+void make_plan(const VtxFmt& f, VtxPlan& pl) {
+    pl.nsteps = 0;
+    pl.size = vertex_size(f);
+    std::memset(&pl.tmpl, 0, sizeof pl.tmpl);
+    auto add = [&](VtxStep s) { pl.steps[pl.nsteps++] = s; };
+    for (int i = 0; i < 9; ++i) {
+        pl.tmpl.mtx[i] = f.mtx_default[i];
+        if (f.lo >> i & 1) add({nullptr, VS_MTX, 1, 0, 1, 0, (uint16_t)(offsetof(GVtx, mtx) + i), 0, 0});
+    }
+    const uint32_t pos = f.lo >> 9 & 3, nrm = f.lo >> 11 & 3, col[2] = {f.lo >> 13 & 3, f.lo >> 15 & 3};
+    pl.flags = (col[0] ? VTX_COL0 : 0) | (col[1] ? VTX_COL1 : 0) | (nrm ? VTX_NRM : 0) | (nrm && f.nbt ? VTX_NBT : 0);
+    if (pos)
+        add({comp_reader(f.pos_fmt, f.pos_n), VS_FLOATS, (uint8_t)pos, 0, (uint8_t)(f.pos_n * fmt_size(f.pos_fmt)), 0,
+             (uint16_t)offsetof(GVtx, pos), 0, f.pos_sc});
+    if (nrm) {
+        const int nsz = fmt_size(f.nrm_fmt);
+        if (f.nbt && f.nidx3 && nrm != 1) {
+            const uint16_t dst[3] = {offsetof(GVtx, nrm), offsetof(GVtx, bin), offsetof(GVtx, tan)};
+            for (int j = 0; j < 3; ++j)
+                add({comp_reader(f.nrm_fmt, 3), VS_FLOATS, (uint8_t)nrm, 1, 0, 0, dst[j], (uint32_t)(j * 3 * nsz), f.nrm_sc});
+        } else {
+            const int n = f.nbt ? 9 : 3;                        // nrm, bin, tan follow each other in GVtx
+            add({comp_reader(f.nrm_fmt, n), VS_FLOATS, (uint8_t)nrm, 1, (uint8_t)(n * nsz), 0,
+                 (uint16_t)offsetof(GVtx, nrm), 0, f.nrm_sc});
         }
     }
-    return flags;
+    for (int c = 0; c < 2; ++c) {
+        if (col[c])
+            add({nullptr, VS_COLOR, (uint8_t)col[c], (uint8_t)(2 + c), (uint8_t)col_size(f.col_fmt[c]),
+                 (uint8_t)f.col_fmt[c], (uint16_t)(offsetof(GVtx, col) + 4 * c), 0, 0});
+        else std::memset(pl.tmpl.col[c], 255, 4);               // a missing colour reads as white
+    }
+    for (int t = 0; t < 8; ++t) {
+        const uint32_t m = f.hi >> (2 * t) & 3;
+        if (m)
+            add({comp_reader(f.tc_fmt[t], f.tc_n[t]), VS_FLOATS, (uint8_t)m, (uint8_t)(4 + t),
+                 (uint8_t)(f.tc_n[t] * fmt_size(f.tc_fmt[t])), 0, (uint16_t)(offsetof(GVtx, tc) + 8 * t), 0,
+                 f.tc_sc[t]});
+    }
+}
+
+// the plan for vertex format `v` as CP now describes it
+const VtxPlan& vtx_plan(int v) {
+    static VtxPlan plans[8];
+    const uint32_t key[7] = {cp[0x70 + v], cp[0x80 + v], cp[0x90 + v], cp[0x50], cp[0x60], cp[0x30], cp[0x40]};
+    VtxPlan& pl = plans[v];
+    if (!pl.valid || std::memcmp(pl.key, key, sizeof key)) {
+        make_plan(vtx_fmt(v), pl);
+        std::memcpy(pl.key, key, sizeof key);
+        pl.valid = true;
+    }
+    return pl;
+}
+
+uint8_t decode_planned(const VtxPlan& pl, const uint8_t* p, uint32_t count, GVtx* out) {
+    uint32_t base[24], stride[24];                             // the indexed steps' arrays, for this draw
+    for (int i = 0; i < pl.nsteps; ++i) {
+        const VtxStep& s = pl.steps[i];
+        if (s.mode >= 2) { base[i] = cp[0xA0 + s.arr] + s.sub; stride[i] = cp[0xB0 + s.arr]; }
+    }
+    for (uint32_t k = 0; k < count; ++k) {
+        GVtx& v = out[k];
+        std::memcpy(&v, &pl.tmpl, sizeof v);
+        uint8_t* vb = reinterpret_cast<uint8_t*>(&v);
+        for (int i = 0; i < pl.nsteps; ++i) {
+            const VtxStep& s = pl.steps[i];
+            const uint8_t* q;
+            if (s.mode == 1) { q = p; p += s.size; }
+            else {
+                uint32_t idx;
+                if (s.mode == 2) idx = *p++;
+                else { idx = be16(p); p += 2; }
+                q = host(virt(base[i] + idx * stride[i]));
+            }
+            switch (s.kind) {
+            case VS_FLOATS: s.read(q, reinterpret_cast<float*>(vb + s.dst), s.sc); break;
+            case VS_COLOR: read_col(q, s.fmt, vb + s.dst); break;
+            default: vb[s.dst] = *q; break;
+            }
+        }
+    }
+    return pl.flags;
 }
 
 // ---- BP ----------------------------------------------------------------------------------------
@@ -545,8 +628,8 @@ size_t parse(const uint8_t* p, size_t n, bool in_dl) {
     if (op >= 0x80 && op < 0xC0) {
         if (n < 3) return 0;
         uint32_t count = (uint32_t)p[1] << 8 | p[2];
-        VtxFmt f = vtx_fmt(op & 7);
-        size_t len = 3 + (size_t)count * vertex_size(f);
+        const VtxPlan& plan = vtx_plan(op & 7);
+        size_t len = 3 + (size_t)count * plan.size;
         if (n < len) return 0;
         ++st.draws;
         st.verts += count;
@@ -576,10 +659,10 @@ size_t parse(const uint8_t* p, size_t n, bool in_dl) {
             uint8_t fl;
             if (g_vperf_on) {
                 auto t0 = std::chrono::steady_clock::now();
-                fl = decode_vertices(f, p + 3, count, out);
+                fl = decode_planned(plan, p + 3, count, out);
                 g_vperf.vtx += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
             } else {
-                fl = decode_vertices(f, p + 3, count, out);
+                fl = decode_planned(plan, p + 3, count, out);
             }
             if (extend && rec[draw_hdr + 2] != fl) {      // other attributes: a draw of its own
                 const uint8_t hdr[7] = {VC_DRAW, (uint8_t)(op & 0xF8), 0, 0, 0, 0, 0};
